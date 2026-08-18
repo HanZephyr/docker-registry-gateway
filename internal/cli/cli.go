@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -40,12 +42,16 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runConfig(arguments[1:], output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
+	case "start":
+		return runStart(ctx, arguments[1:], output, errorOutput)
 	case "status":
 		return runStatus(ctx, arguments[1:], output, errorOutput)
 	case "reload":
 		return runReload(ctx, arguments[1:], output, errorOutput)
 	case "stop":
 		return runStop(ctx, arguments[1:], output, errorOutput)
+	case "restart":
+		return runRestart(ctx, arguments[1:], output, errorOutput)
 	case "tls":
 		return runTLS(ctx, arguments[1:], output, errorOutput)
 	case "help", "--help", "-h":
@@ -294,6 +300,60 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 	return 0
 }
 
+func runStart(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	loaded, configPath, exitCode := loadControlConfigurationWithPath("start", arguments, errorOutput)
+	if exitCode != 0 {
+		return exitCode
+	}
+	probeContext, cancel := context.WithTimeout(ctx, time.Second)
+	_, statusErr := control.StatusRequest(probeContext, loaded.DataDir)
+	cancel()
+	if statusErr == nil {
+		fmt.Fprintln(errorOutput, "Gateway 已在运行；请使用 drg status、drg reload 或 drg restart。")
+		return 1
+	}
+	if err := os.MkdirAll(loaded.DataDir, 0o700); err != nil {
+		fmt.Fprintf(errorOutput, "创建数据目录失败: %v\n", err)
+		return 1
+	}
+	logPath := filepath.Join(loaded.DataDir, "serve.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "打开服务日志失败: %v\n", err)
+		return 1
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		logFile.Close()
+		fmt.Fprintf(errorOutput, "定位 drg 可执行文件失败: %v\n", err)
+		return 1
+	}
+	command := exec.Command(executable, "serve", "--config", configPath)
+	command.Stdout = logFile
+	command.Stderr = logFile
+	if err := command.Start(); err != nil {
+		logFile.Close()
+		fmt.Fprintf(errorOutput, "启动 Gateway 子进程失败: %v\n", err)
+		return 1
+	}
+	_ = logFile.Close()
+	go func() { _ = command.Wait() }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		probeContext, cancel := context.WithTimeout(ctx, time.Second)
+		status, err := control.StatusRequest(probeContext, loaded.DataDir)
+		cancel()
+		if err == nil && status.PID == command.Process.Pid {
+			fmt.Fprintf(output, "DRG 已在后台启动（PID %d）。日志：%s\n", status.PID, logPath)
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fmt.Fprintf(errorOutput, "Gateway 未在 10 秒内就绪；请检查日志：%s\n", logPath)
+	return 1
+}
+
 func runReload(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	loaded, exitCode := loadControlConfiguration("reload", arguments, errorOutput)
 	if exitCode != 0 {
@@ -336,23 +396,71 @@ func runStop(ctx context.Context, arguments []string, output, errorOutput io.Wri
 	return 0
 }
 
-func loadControlConfiguration(command string, arguments []string, errorOutput io.Writer) (config.Config, int) {
-	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+func runRestart(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("restart", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	force := flags.Bool("force", false, "立即取消活跃传输后重启")
 	if err := flags.Parse(arguments); err != nil {
-		return config.Config{}, 2
+		return 2
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintf(errorOutput, "%s 不接受位置参数\n", command)
-		return config.Config{}, 2
+		fmt.Fprintln(errorOutput, "restart 不接受位置参数")
+		return 2
 	}
 	loaded, err := config.LoadFile(*configPath)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
-		return config.Config{}, 1
+		return 1
 	}
-	return loaded, 0
+	stopArguments := []string{"--config", *configPath}
+	if *force {
+		stopArguments = append(stopArguments, "--force")
+	}
+	if exitCode := runStop(ctx, stopArguments, output, errorOutput); exitCode != 0 {
+		return exitCode
+	}
+	fmt.Fprintln(output, "正在等待原服务完全退出…")
+	deadline := time.Now().Add(35 * time.Second)
+	for time.Now().Before(deadline) {
+		probeContext, cancel := context.WithTimeout(ctx, time.Second)
+		_, statusErr := control.StatusRequest(probeContext, loaded.DataDir)
+		cancel()
+		if statusErr != nil {
+			return runStart(ctx, []string{"--config", *configPath}, output, errorOutput)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Fprintln(errorOutput, "原服务未在 35 秒内退出；未启动新实例。可检查 drg status，或使用 drg restart --force。")
+	return 1
+}
+
+func loadControlConfiguration(command string, arguments []string, errorOutput io.Writer) (config.Config, int) {
+	loaded, _, exitCode := loadControlConfigurationWithPath(command, arguments, errorOutput)
+	return loaded, exitCode
+}
+
+func loadControlConfigurationWithPath(command string, arguments []string, errorOutput io.Writer) (config.Config, string, int) {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	if err := flags.Parse(arguments); err != nil {
+		return config.Config{}, "", 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(errorOutput, "%s 不接受位置参数\n", command)
+		return config.Config{}, "", 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return config.Config{}, "", 1
+	}
+	absPath, err := filepath.Abs(*configPath)
+	if err != nil {
+		absPath = *configPath
+	}
+	return loaded, absPath, 0
 }
 
 func runConfig(arguments []string, output, errorOutput io.Writer) int {
@@ -428,8 +536,8 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 		fmt.Fprintln(output, "已按 --no-start 跳过启动；请自行将 Docker 的 registry-mirrors 指向访问地址。")
 		return 0
 	}
-	fmt.Fprintln(output, "证书已就绪，正在启动服务；Docker 镜像源配置仍由你自行完成。")
-	return runServe(ctx, []string{"--config", *configPath}, output, errorOutput)
+	fmt.Fprintln(output, "证书已就绪，正在后台启动服务；Docker 镜像源配置仍由你自行完成。")
+	return runStart(ctx, []string{"--config", *configPath}, output, errorOutput)
 }
 
 func prompt(reader *bufio.Reader, output io.Writer, label, defaultValue string) (string, error) {
@@ -461,7 +569,9 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  config validate  严格校验主配置")
 	fmt.Fprintln(output, "  tls reconcile  对账本地 CA 与服务端证书")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
+	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
 	fmt.Fprintln(output, "  status  查看本地 Gateway 运行状态")
 	fmt.Fprintln(output, "  reload  校验并热加载主配置")
 	fmt.Fprintln(output, "  stop [--force]  平滑或强制停止本地 Gateway")
+	fmt.Fprintln(output, "  restart [--force]  停止并重新启动本地 Gateway")
 }
