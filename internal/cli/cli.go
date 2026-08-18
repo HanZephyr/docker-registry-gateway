@@ -84,15 +84,27 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 }
 
 func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
-	if len(arguments) == 0 || arguments[0] != "reconcile" {
-		fmt.Fprintln(errorOutput, "用法：drg tls reconcile --config <路径>")
+	if len(arguments) == 0 {
+		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root> --config <路径>")
 		return 2
 	}
+	switch arguments[0] {
+	case "reconcile":
+		return runTLSReconcile(ctx, arguments[1:], output, errorOutput)
+	case "rotate-root":
+		return runTLSRotateRoot(ctx, arguments[1:], output, errorOutput)
+	default:
+		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root> --config <路径>")
+		return 2
+	}
+}
+
+func runTLSReconcile(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("tls reconcile", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	skipTrustInstall := flags.Bool("skip-trust-install", false, "跳过本次 Docker 信任安装")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 {
@@ -122,6 +134,53 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 		return 1
 	}
 	fmt.Fprintf(output, "TLS 对账完成：CA=%s，证书=%s，本次新建根 CA=%t，本次签发叶子证书=%t\n", result.CAPath, result.Certificate, result.RootCreated, result.LeafIssued)
+	return 0
+}
+
+func runTLSRotateRoot(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("tls rotate-root", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	skipTrustInstall := flags.Bool("skip-trust-install", false, "跳过本次 Docker 信任安装")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(errorOutput, "tls rotate-root 不接受位置参数")
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return 1
+	}
+	if !loaded.Server.TLS.LocalCA {
+		fmt.Fprintln(errorOutput, "tls rotate-root 只适用于 local_ca: true；外部证书应由其签发方轮换。")
+		return 2
+	}
+	result, err := localca.RotateRoot(ctx, localca.Options{DataDir: loaded.DataDir, AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint})
+	if err != nil {
+		fmt.Fprintf(errorOutput, "本地 CA 轮换失败: %v\n", err)
+		return 1
+	}
+	if loaded.Server.TLS.InstallTrust && !*skipTrustInstall {
+		if err := installRootTrust(loaded, result.PreviousCAPath, "drg-ca-previous.crt", output); err != nil {
+			fmt.Fprintf(errorOutput, "安装上一根 Docker 信任 CA 失败: %v\n", err)
+			return 1
+		}
+		if err := installRootTrust(loaded, result.CAPath, "", output); err != nil {
+			fmt.Fprintf(errorOutput, "安装新 Docker 信任 CA 失败: %v\n", err)
+			return 1
+		}
+	}
+	statusContext, cancel := context.WithTimeout(ctx, time.Second)
+	_, runningErr := control.StatusRequest(statusContext, loaded.DataDir)
+	cancel()
+	if runningErr == nil {
+		fmt.Fprintln(output, "根 CA 已轮换，新旧根均已保留为 Docker 信任材料。正在运行的 Gateway 仍可能使用旧叶证书；请执行 drg restart 完成安全切换。")
+	} else {
+		fmt.Fprintln(output, "根 CA 已轮换，新旧根均已保留为 Docker 信任材料；下次启动将使用新叶证书。")
+	}
 	return 0
 }
 
@@ -381,13 +440,21 @@ func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bo
 	if !loaded.Server.TLS.InstallTrust || skipTrustInstall {
 		return result, nil
 	}
+	if err := installRootTrust(loaded, result.CAPath, "", output); err != nil {
+		return localca.Result{}, err
+	}
+	return result, nil
+}
+
+func installRootTrust(loaded config.Config, caPath, managedFileName string, output io.Writer) error {
 	trustResult, err := trust.Install(trust.Options{
-		CAPath:            result.CAPath,
+		CAPath:            caPath,
 		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
+		ManagedFileName:   managedFileName,
 		IsContainer:       trust.InContainer(),
 	})
 	if err != nil {
-		return localca.Result{}, fmt.Errorf("安装 Docker 信任根: %w", err)
+		return fmt.Errorf("安装 Docker 信任根: %w", err)
 	}
 	for _, path := range trustResult.Installed {
 		fmt.Fprintf(output, "Docker 信任根已安装：%s\n", path)
@@ -398,7 +465,7 @@ func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bo
 	for _, instruction := range trustResult.Instructions {
 		fmt.Fprintf(output, "TLS 操作：%s\n", instruction)
 	}
-	return result, nil
+	return nil
 }
 
 const (

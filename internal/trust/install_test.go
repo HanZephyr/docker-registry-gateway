@@ -105,3 +105,31 @@ func TestInstallMacOSAttemptsSystemKeychainTrust(t *testing.T) {
 		t.Errorf("installed = %q, want system keychain installation", result.Installed)
 	}
 }
+
+func TestInstallLinuxUsesDistinctManagedFileForTransitionRoot(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	caPath := filepath.Join(directory, "previous-ca.crt")
+	if err := os.WriteFile(caPath, []byte("previous root certificate"), 0o600); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+	certsDirectory := filepath.Join(directory, "certs")
+	result, err := trust.Install(trust.Options{
+		CAPath:            caPath,
+		AdvertiseEndpoint: "drg.example.test:443",
+		ManagedFileName:   "drg-ca-previous.crt",
+		Platform:          "linux",
+		LinuxCertsDir:     certsDirectory,
+	})
+	if err != nil {
+		t.Fatalf("trust.Install() error = %v", err)
+	}
+	want := filepath.Join(certsDirectory, "drg.example.test", "drg-ca-previous.crt")
+	if len(result.Installed) != 2 || result.Installed[0] != want {
+		t.Errorf("installed = %#v, want first %q", result.Installed, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("transition trust file stat error = %v", err)
+	}
+}

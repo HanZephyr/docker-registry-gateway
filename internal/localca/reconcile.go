@@ -30,6 +30,7 @@ const (
 	serverCertificate   = "server.crt"
 	serverKey           = "server.key"
 	identityFile        = "identity.json"
+	previousRootFile    = "ca.previous.crt"
 
 	leafValidity = 90 * 24 * time.Hour
 	renewBefore  = 30 * 24 * time.Hour
@@ -46,13 +47,15 @@ type Options struct {
 
 // Result describes files reconciled during a call.
 type Result struct {
-	RootCreated  bool
-	LeafIssued   bool
-	InstanceID   string
-	CAPath       string
-	Certificate  string
-	PrivateKey   string
-	IdentityPath string
+	RootCreated    bool
+	RootRotated    bool
+	LeafIssued     bool
+	InstanceID     string
+	CAPath         string
+	PreviousCAPath string
+	Certificate    string
+	PrivateKey     string
+	IdentityPath   string
 }
 
 type identity struct {
@@ -83,10 +86,11 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 	}
 
 	result := Result{
-		CAPath:       filepath.Join(pkiDirectory, rootCertificateFile),
-		Certificate:  filepath.Join(pkiDirectory, serverCertificate),
-		PrivateKey:   filepath.Join(pkiDirectory, serverKey),
-		IdentityPath: filepath.Join(pkiDirectory, identityFile),
+		CAPath:         filepath.Join(pkiDirectory, rootCertificateFile),
+		PreviousCAPath: filepath.Join(pkiDirectory, previousRootFile),
+		Certificate:    filepath.Join(pkiDirectory, serverCertificate),
+		PrivateKey:     filepath.Join(pkiDirectory, serverKey),
+		IdentityPath:   filepath.Join(pkiDirectory, identityFile),
 	}
 	rootKeyPath := filepath.Join(pkiDirectory, rootKeyFile)
 
@@ -108,6 +112,55 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 	if leafKey == nil {
 		return Result{}, errors.New("server key is missing")
 	}
+	return result, nil
+}
+
+// RotateRoot explicitly replaces the durable local CA while retaining the
+// previous public root next to it. Callers install both roots into Docker
+// trust before restarting a running Gateway, so its currently served leaf is
+// not suddenly distrusted during the transition.
+func RotateRoot(ctx context.Context, options Options) (Result, error) {
+	result, err := Reconcile(ctx, options)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	now := time.Now().UTC()
+	if options.Now != nil {
+		now = options.Now().UTC()
+	}
+	currentRoot, _, _, err := loadOrCreateRoot(result.CAPath, filepath.Join(filepath.Dir(result.CAPath), rootKeyFile), result.IdentityPath, now)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := writeCertificate(result.PreviousCAPath, currentRoot); err != nil {
+		return Result{}, fmt.Errorf("preserve previous local CA certificate: %w", err)
+	}
+	newRoot, newKey, err := createRoot(now)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := writeCertificate(result.CAPath, newRoot); err != nil {
+		return Result{}, err
+	}
+	if err := writeECPrivateKey(filepath.Join(filepath.Dir(result.CAPath), rootKeyFile), newKey); err != nil {
+		return Result{}, err
+	}
+	if err := writeIdentity(result.IdentityPath, newRoot); err != nil {
+		return Result{}, err
+	}
+	host, _, err := splitEndpoint(options.AdvertiseEndpoint)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := issueLeaf(result.Certificate, result.PrivateKey, newRoot, newKey, host, now); err != nil {
+		return Result{}, err
+	}
+	result.RootRotated = true
+	result.LeafIssued = true
+	result.InstanceID = fingerprint(newRoot)
 	return result, nil
 }
 

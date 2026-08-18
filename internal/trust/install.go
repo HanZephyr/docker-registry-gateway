@@ -21,6 +21,7 @@ const managedCAFile = "drg-ca.crt"
 type Options struct {
 	CAPath            string
 	AdvertiseEndpoint string
+	ManagedFileName   string
 	Platform          string
 	LinuxCertsDir     string
 	IsContainer       bool
@@ -51,6 +52,10 @@ func Install(options Options) (Result, error) {
 	if len(contents) == 0 {
 		return Result{}, errors.New("local root CA is empty")
 	}
+	managedFileName, err := managedFileName(options.ManagedFileName)
+	if err != nil {
+		return Result{}, err
+	}
 	names, err := registryNames(options.AdvertiseEndpoint)
 	if err != nil {
 		return Result{}, err
@@ -60,7 +65,7 @@ func Install(options Options) (Result, error) {
 		platform = runtime.GOOS
 	}
 	if options.IsContainer {
-		return Result{Instructions: containerInstructions(options.CAPath, names)}, nil
+		return Result{Instructions: containerInstructions(options.CAPath, names, managedFileName)}, nil
 	}
 
 	switch platform {
@@ -79,13 +84,13 @@ func Install(options Options) (Result, error) {
 		if baseDirectory == "" {
 			baseDirectory = "/etc/docker/certs.d"
 		}
-		result, err := installInto(baseDirectory, names, contents)
+		result, err := installInto(baseDirectory, names, contents, managedFileName)
 		if err != nil {
 			return Result{
 				Notices: []string{fmt.Sprintf("无法写入 Docker 信任目录 %s: %v", baseDirectory, err)},
 				Instructions: []string{
 					fmt.Sprintf("sudo mkdir -p %s", shellQuote(filepath.Join(baseDirectory, names[0]))),
-					fmt.Sprintf("sudo cp %s %s", shellQuote(options.CAPath), shellQuote(filepath.Join(baseDirectory, names[0], managedCAFile))),
+					fmt.Sprintf("sudo cp %s %s", shellQuote(options.CAPath), shellQuote(filepath.Join(baseDirectory, names[0], managedFileName))),
 					"然后重启或重载 Docker daemon（具体方式取决于你的发行版）。",
 				},
 			}, nil
@@ -118,14 +123,14 @@ func InContainer() bool {
 	return err == nil
 }
 
-func installInto(baseDirectory string, names []string, contents []byte) (Result, error) {
+func installInto(baseDirectory string, names []string, contents []byte, managedFileName string) (Result, error) {
 	result := Result{}
 	for _, name := range names {
 		directory := filepath.Join(baseDirectory, name)
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			return Result{}, err
 		}
-		path := filepath.Join(directory, managedCAFile)
+		path := filepath.Join(directory, managedFileName)
 		if err := os.WriteFile(path, contents, 0o644); err != nil {
 			return Result{}, err
 		}
@@ -157,14 +162,24 @@ func registryDirectoryName(host, port string) string {
 	return host + ":" + port
 }
 
-func containerInstructions(caPath string, names []string) []string {
+func containerInstructions(caPath string, names []string, managedFileName string) []string {
 	joined := strings.Join(names, "、")
 	return []string{
 		fmt.Sprintf("容器内的 DRG 不会改写宿主机。将持久卷中的根证书 %s 复制到运行 Docker daemon 的宿主机。", caPath),
-		fmt.Sprintf("Linux：对每个名称（%s）执行 sudo mkdir -p /etc/docker/certs.d/<名称>，再复制为 /etc/docker/certs.d/<名称>/%s。", joined, managedCAFile),
+		fmt.Sprintf("Linux：对每个名称（%s）执行 sudo mkdir -p /etc/docker/certs.d/<名称>，再复制为 /etc/docker/certs.d/<名称>/%s。", joined, managedFileName),
 		fmt.Sprintf("Windows Docker Desktop：执行 certutil -user -addstore Root %s，然后重启 Docker Desktop。", shellQuote(caPath)),
 		fmt.Sprintf("macOS Docker Desktop：执行 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s，然后重启 Docker Desktop。", shellQuote(caPath)),
 	}
+}
+
+func managedFileName(configured string) (string, error) {
+	if configured == "" {
+		return managedCAFile, nil
+	}
+	if filepath.Base(configured) != configured || configured == "." || configured == string(filepath.Separator) {
+		return "", errors.New("managed CA file name must not contain a path")
+	}
+	return configured, nil
 }
 
 func installWindowsRoot(options Options) (Result, error) {

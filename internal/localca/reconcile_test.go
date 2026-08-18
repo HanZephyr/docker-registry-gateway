@@ -70,6 +70,43 @@ func TestReconcileRejectsInsecureExistingRootPrivateKey(t *testing.T) {
 	}
 }
 
+func TestRotateRootPreservesPreviousTrustAndIssuesNewLeaf(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.August, 18, 0, 0, 0, 0, time.UTC)
+	initial, err := localca.Reconcile(context.Background(), localca.Options{
+		DataDir:           dataDir,
+		AdvertiseEndpoint: "drg.localhost:5443",
+		Now:               func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+	oldRoot := readCertificate(t, initial.CAPath)
+	rotated, err := localca.RotateRoot(context.Background(), localca.Options{
+		DataDir:           dataDir,
+		AdvertiseEndpoint: "drg.localhost:5443",
+		Now:               func() time.Time { return now.Add(time.Hour) },
+	})
+	if err != nil {
+		t.Fatalf("RotateRoot() error = %v", err)
+	}
+	if !rotated.RootRotated || !rotated.LeafIssued || rotated.InstanceID == initial.InstanceID {
+		t.Errorf("rotation result = %+v, want a new root and leaf identity", rotated)
+	}
+	if previous := readCertificate(t, rotated.PreviousCAPath); string(previous.Raw) != string(oldRoot.Raw) {
+		t.Error("previous CA certificate did not preserve the original root")
+	}
+	newRoot := readCertificate(t, rotated.CAPath)
+	leaf := readCertificate(t, rotated.Certificate)
+	roots := x509.NewCertPool()
+	roots.AddCert(newRoot)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: "drg.localhost", CurrentTime: now.Add(2 * time.Hour)}); err != nil {
+		t.Errorf("rotated leaf does not verify against new root: %v", err)
+	}
+}
+
 func readCertificate(t *testing.T, path string) *x509.Certificate {
 	t.Helper()
 	contents, err := os.ReadFile(path)
