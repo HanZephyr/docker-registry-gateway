@@ -52,8 +52,10 @@ type Server struct {
 
 // TLS configures Gateway-facing transport security.
 type TLS struct {
-	LocalCA           bool   `yaml:"local_ca"`
-	AdvertiseEndpoint string `yaml:"advertise_endpoint"`
+	LocalCA               bool   `yaml:"local_ca"`
+	AdvertiseEndpoint     string `yaml:"advertise_endpoint"`
+	InstallTrust          bool   `yaml:"-"`
+	InstallTrustSpecified *bool  `yaml:"install_trust"`
 }
 
 // Provider declares an upstream Registry.
@@ -129,6 +131,11 @@ func Load(reader io.Reader) (Config, error) {
 func (value *Config) applyDefaults() {
 	if value.DataDir == "" {
 		value.DataDir = ".drg"
+	}
+	if value.Server.TLS.InstallTrustSpecified == nil {
+		value.Server.TLS.InstallTrust = true
+	} else {
+		value.Server.TLS.InstallTrust = *value.Server.TLS.InstallTrustSpecified
 	}
 	if value.Resolution.ConflictStrategy == "" {
 		value.Resolution.ConflictStrategy = "majority"

@@ -33,6 +33,7 @@ func TestRunCreatesANewValidDefaultConfiguration(t *testing.T) {
 	for _, expected := range []string{
 		"version: 1",
 		"advertise_endpoint: drg.localhost:5443",
+		"install_trust: true",
 		"- 127.0.0.1:5443",
 		"- '[::1]:5443'",
 		"url: https://registry-1.docker.io",

@@ -101,6 +101,7 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string) string {
 	}
 	builder.WriteString("  tls:\n")
 	builder.WriteString("    local_ca: true\n")
+	builder.WriteString("    install_trust: true\n")
 	builder.WriteString("    advertise_endpoint: ")
 	builder.WriteString(yamlScalar(advertiseEndpoint))
 	builder.WriteString("\n\n")

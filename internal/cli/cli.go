@@ -26,6 +26,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/provider"
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/router"
+	"github.com/hjx/docker-registry-gateway/internal/trust"
 )
 
 // Run executes a drg command and returns a process-compatible exit code.
@@ -71,6 +72,7 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 	flags := flag.NewFlagSet("tls reconcile", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	skipTrustInstall := flags.Bool("skip-trust-install", false, "跳过本次 Docker 信任安装")
 	if err := flags.Parse(arguments[1:]); err != nil {
 		return 2
 	}
@@ -87,16 +89,44 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 		fmt.Fprintln(errorOutput, "local_ca 已关闭，无法执行本地 CA 对账")
 		return 1
 	}
-	result, err := localca.Reconcile(ctx, localca.Options{
-		DataDir:           loaded.DataDir,
-		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
-	})
+	result, err := reconcileTLS(ctx, loaded, *skipTrustInstall, output)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(output, "TLS 对账完成：CA=%s，证书=%s，本次新建根 CA=%t，本次签发叶子证书=%t\n", result.CAPath, result.Certificate, result.RootCreated, result.LeafIssued)
 	return 0
+}
+
+func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bool, output io.Writer) (localca.Result, error) {
+	result, err := localca.Reconcile(ctx, localca.Options{
+		DataDir:           loaded.DataDir,
+		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
+	})
+	if err != nil {
+		return localca.Result{}, err
+	}
+	if !loaded.Server.TLS.InstallTrust || skipTrustInstall {
+		return result, nil
+	}
+	trustResult, err := trust.Install(trust.Options{
+		CAPath:            result.CAPath,
+		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
+		IsContainer:       trust.InContainer(),
+	})
+	if err != nil {
+		return localca.Result{}, fmt.Errorf("安装 Docker 信任根: %w", err)
+	}
+	for _, path := range trustResult.Installed {
+		fmt.Fprintf(output, "Docker 信任根已安装：%s\n", path)
+	}
+	for _, notice := range trustResult.Notices {
+		fmt.Fprintf(output, "TLS 提示：%s\n", notice)
+	}
+	for _, instruction := range trustResult.Instructions {
+		fmt.Fprintf(output, "TLS 操作：%s\n", instruction)
+	}
+	return result, nil
 }
 
 func runServe(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
@@ -124,10 +154,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	if err != nil {
 		absConfigPath = *configPath
 	}
-	tlsResult, err := localca.Reconcile(ctx, localca.Options{
-		DataDir:           loaded.DataDir,
-		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
-	})
+	tlsResult, err := reconcileTLS(ctx, loaded, false, output)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", err)
 		return 1
@@ -495,6 +522,7 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	noStart := flags.Bool("no-start", false, "仅生成配置和证书，不启动服务")
+	skipTrustInstall := flags.Bool("skip-trust-install", false, "跳过本次 Docker 信任安装")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -529,7 +557,11 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 		absPath = *configPath
 	}
 	fmt.Fprintf(output, "已生成配置：%s\n", absPath)
-	if exitCode := runTLS(ctx, []string{"reconcile", "--config", *configPath}, output, errorOutput); exitCode != 0 {
+	tlsArguments := []string{"reconcile", "--config", *configPath}
+	if *skipTrustInstall {
+		tlsArguments = append(tlsArguments, "--skip-trust-install")
+	}
+	if exitCode := runTLS(ctx, tlsArguments, output, errorOutput); exitCode != 0 {
 		return exitCode
 	}
 	if *noStart {

@@ -24,7 +24,7 @@ Gateway 是拉取流量的路由器，不是传统 Registry 的替代品。它�
 
 ## Platform Trust Flow（平台信任流程）
 
-本地根 CA 的安装按运行 Docker daemon 的宿主平台处理，而不是按 Gateway 的运行环境处理。原生 Gateway 自动识别宿主平台并在权限允许时执行对应安装；权限不足时给出该平台的修复命令。容器中的 Linux 环境不能推断 Docker 宿主机是 Linux、Windows 还是 macOS，故只保存根证书并分别输出三套带有实际 `advertise_endpoint` 的宿主机操作提示，绝不猜测或改写宿主机文件。
+本地根 CA 的安装按运行 Docker daemon 的宿主平台处理，而不是按 Gateway 的运行环境处理。原生 Gateway 自动识别宿主平台并在权限允许时执行对应安装；权限不足时给出该平台的修复命令。Linux 为每个访问名写入 `/etc/docker/certs.d/<name>/drg-ca.crt`；Windows Docker Desktop 将根导入当前用户的 Trusted Root Certification Authorities，再由 Desktop 同步，不能把带端口的 `<name>:<port>` 当作 NTFS 目录名；macOS 尝试写入系统钥匙串的根信任，权限不足时输出 `security` 命令。容器中的 Linux 环境不能推断 Docker 宿主机是 Linux、Windows 还是 macOS，故只保存根证书并分别输出三套带有实际 `advertise_endpoint` 的宿主机操作提示，绝不猜测或改写宿主机文件。
 
 ## TLS Reconciliation（TLS 对账）
 

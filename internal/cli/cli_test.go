@@ -21,7 +21,7 @@ func TestRunOnboardGuidesUserAndCreatesConfiguration(t *testing.T) {
 	var output bytes.Buffer
 	var errors bytes.Buffer
 
-	exitCode := cli.Run(context.Background(), []string{"onboard", "--no-start", "--config", configPath}, input, &output, &errors)
+	exitCode := cli.Run(context.Background(), []string{"onboard", "--no-start", "--skip-trust-install", "--config", configPath}, input, &output, &errors)
 	if exitCode != 0 {
 		t.Fatalf("cli.Run() exit code = %d, stderr = %s", exitCode, errors.String())
 	}
@@ -66,6 +66,7 @@ server:
   listeners: [127.0.0.1:5443]
   tls:
     local_ca: true
+    install_trust: false
     advertise_endpoint: drg.localhost:5443
 providers:
   - name: docker_hub
@@ -104,6 +105,7 @@ server:
   listeners: [127.0.0.1:5443]
   tls:
     local_ca: true
+    install_trust: false
     advertise_endpoint: drg.localhost:5443
 providers:
   - name: docker_hub
@@ -147,6 +149,7 @@ server:
   listeners: [127.0.0.1:5443]
   tls:
     local_ca: true
+    install_trust: false
     advertise_endpoint: drg.localhost:5443
 providers:
   - name: docker_hub
@@ -210,6 +213,7 @@ server:
   listeners: [127.0.0.1:0]
   tls:
     local_ca: true
+    install_trust: false
     advertise_endpoint: drg.localhost:5443
 providers:
   - name: docker_hub

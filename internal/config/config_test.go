@@ -42,6 +42,9 @@ allow_non_range_providers: true
 	if !loaded.AllowNonRangeProviders {
 		t.Error("allow_non_range_providers default = false, want true")
 	}
+	if !loaded.Server.TLS.InstallTrust {
+		t.Error("server.tls.install_trust default = false, want true")
+	}
 	if got, want := loaded.Resources.MaxNoRangeRestartDiscard, "64MiB"; got != want {
 		t.Errorf("max_no_range_restart_discard default = %q, want %q", got, want)
 	}
@@ -153,6 +156,31 @@ allow_non_range_providers: true
 `))
 	if err == nil || !strings.Contains(err.Error(), "priority") {
 		t.Fatalf("config.Load() error = %v, want missing priority rejection", err)
+	}
+}
+
+func TestLoadHonorsDisabledAutomaticTrustInstallation(t *testing.T) {
+	t.Parallel()
+
+	loaded, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: true
+    install_trust: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`))
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	if loaded.Server.TLS.InstallTrust {
+		t.Error("install_trust = true, want explicit false")
 	}
 }
 
