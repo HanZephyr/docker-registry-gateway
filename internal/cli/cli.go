@@ -283,7 +283,43 @@ func runProviderAdd(ctx context.Context, arguments []string, output, errorOutput
 	}
 	candidate := loaded
 	candidate.Providers = append(append([]config.Provider(nil), loaded.Providers...), provider)
+	probeResult, err := probeProviderAdmission(ctx, provider, candidate.ProbeRef, candidate.AllowNonRangeProviders)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "Provider %s 准入探测失败，未写入配置: %v\n", provider.Name, err)
+		return 1
+	}
+	if probeResult.RangeSupported {
+		fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", provider.Name)
+	} else {
+		fmt.Fprintf(output, "Provider %s 准入探测通过但不支持 Range：将作为降级下载源。\n", provider.Name)
+	}
 	return applyProviderConfiguration(ctx, resolvedConfigPath, candidate, "已添加 Provider "+provider.Name, output, errorOutput)
+}
+
+func probeProviderAdmission(parent context.Context, configured config.Provider, probeRef string, allowNonRange bool) (provider.ProbeResult, error) {
+	username, password, err := configured.Auth.Credentials()
+	if err != nil {
+		return provider.ProbeResult{}, fmt.Errorf("读取上游凭据: %w", err)
+	}
+	client, err := provider.New(provider.Options{
+		URL:      configured.URL,
+		Username: username,
+		Password: password,
+		CAFile:   configured.CAFile,
+	})
+	if err != nil {
+		return provider.ProbeResult{}, err
+	}
+	probeContext, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+	result, err := client.Probe(probeContext, probeRef)
+	if err != nil {
+		return provider.ProbeResult{}, err
+	}
+	if !result.RangeSupported && !allowNonRange {
+		return provider.ProbeResult{}, errors.New("上游不支持 Range，且 allow_non_range_providers 已关闭")
+	}
+	return result, nil
 }
 
 func runProviderRemove(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {

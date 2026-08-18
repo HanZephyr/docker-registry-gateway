@@ -3,6 +3,10 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,6 +216,31 @@ providers:
 	}
 	var reloads int
 	stopped := make(chan bool, 1)
+	probeContents := []byte("probe")
+	probeSum := sha256.Sum256(probeContents)
+	probeDigest := fmt.Sprintf("sha256:%x", probeSum[:])
+	probeManifest := []byte(`{"schemaVersion":2,"config":{"digest":"` + probeDigest + `"}}`)
+	probeServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v2/":
+			response.WriteHeader(http.StatusOK)
+		case "/v2/library/busybox/manifests/latest":
+			response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = response.Write(probeManifest)
+		case "/v2/library/busybox/blobs/" + probeDigest:
+			if request.Header.Get("Range") != "bytes=0-0" {
+				http.Error(response, "Range required", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			response.Header().Set("Content-Range", "bytes 0-0/5")
+			response.Header().Set("Docker-Content-Digest", probeDigest)
+			response.WriteHeader(http.StatusPartialContent)
+			_, _ = response.Write(probeContents[:1])
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer probeServer.Close()
 	server, err := control.Start(dataDir, control.Callbacks{
 		Status: func() control.Status { return control.Status{State: "running", ActivePulls: 3} },
 		Reload: func(context.Context) error {
@@ -240,7 +269,7 @@ providers:
 		{"status", "--config", configPath},
 		{"reload", "--config", configPath},
 		{"resolver", "invalidate", "--config", configPath, "library/nginx:latest"},
-		{"provider", "add", "--config", configPath, "--name", "mirror", "--url", "https://mirror.example.test", "--pull-provider"},
+		{"provider", "add", "--config", configPath, "--name", "mirror", "--url", probeServer.URL, "--pull-provider", "--allow-insecure-http"},
 		{"stop", "--force", "--config", configPath},
 	} {
 		var output bytes.Buffer
@@ -409,8 +438,42 @@ providers:
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write configuration: %v", err)
 	}
+	originalContents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read original configuration: %v", err)
+	}
 	var output, errors bytes.Buffer
-	add := []string{"provider", "add", "--config", configPath, "--name", "mirror", "--url", "https://mirror.example.test", "--resolver", "--pull-provider"}
+	failedAdd := []string{"provider", "add", "--config", configPath, "--name", "unreachable", "--url", "http://127.0.0.1:1", "--pull-provider", "--allow-insecure-http"}
+	if exitCode := cli.Run(context.Background(), failedAdd, strings.NewReader(""), &output, &errors); exitCode == 0 {
+		t.Fatal("provider add unexpectedly accepted an unreachable Provider")
+	}
+	if currentContents, readErr := os.ReadFile(configPath); readErr != nil || string(currentContents) != string(originalContents) {
+		t.Errorf("configuration changed after failed admission: readErr=%v", readErr)
+	}
+	output.Reset()
+	errors.Reset()
+	probeContents := []byte("probe")
+	probeSum := sha256.Sum256(probeContents)
+	probeDigest := fmt.Sprintf("sha256:%x", probeSum[:])
+	probeManifest := []byte(`{"schemaVersion":2,"config":{"digest":"` + probeDigest + `"}}`)
+	probeServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v2/":
+			response.WriteHeader(http.StatusOK)
+		case "/v2/library/busybox/manifests/latest":
+			response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = response.Write(probeManifest)
+		case "/v2/library/busybox/blobs/" + probeDigest:
+			response.Header().Set("Content-Range", "bytes 0-0/5")
+			response.Header().Set("Docker-Content-Digest", probeDigest)
+			response.WriteHeader(http.StatusPartialContent)
+			_, _ = response.Write(probeContents[:1])
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer probeServer.Close()
+	add := []string{"provider", "add", "--config", configPath, "--name", "mirror", "--url", probeServer.URL, "--resolver", "--pull-provider", "--allow-insecure-http"}
 	if exitCode := cli.Run(context.Background(), add, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("provider add exit code = %d, stderr = %s", exitCode, errors.String())
 	}
