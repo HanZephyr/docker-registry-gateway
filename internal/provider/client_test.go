@@ -133,6 +133,47 @@ func TestClientRejectsBlobThatDeclaresDifferentDigest(t *testing.T) {
 	}
 }
 
+func TestClientProbeVerifiesV2ManifestAndBlobRange(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("config bytes")
+	manifest := []byte(`{"schemaVersion":2,"config":{"digest":"` + digest(config) + `"}}`)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v2/":
+			response.WriteHeader(http.StatusOK)
+		case "/v2/library/busybox/manifests/latest":
+			response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			response.Header().Set("Docker-Content-Digest", digest(manifest))
+			_, _ = response.Write(manifest)
+		case "/v2/library/busybox/blobs/" + digest(config):
+			if got, want := request.Header.Get("Range"), "bytes=0-0"; got != want {
+				t.Errorf("probe Range = %q, want %q", got, want)
+			}
+			response.Header().Set("Docker-Content-Digest", digest(config))
+			response.Header().Set("Content-Range", "bytes 0-0/12")
+			response.Header().Set("Content-Length", "1")
+			response.WriteHeader(http.StatusPartialContent)
+			_, _ = response.Write(config[:1])
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	client, err := provider.New(provider.Options{URL: server.URL})
+	if err != nil {
+		t.Fatalf("provider.New() error = %v", err)
+	}
+	result, err := client.Probe(context.Background(), "library/busybox:latest")
+	if err != nil {
+		t.Fatalf("Probe() error = %v", err)
+	}
+	if !result.RangeSupported || result.ManifestDigest != digest(manifest) || result.BlobDigest != digest(config) {
+		t.Errorf("probe result = %#v, want a successful Range-capable admission", result)
+	}
+}
+
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return fmt.Sprintf("sha256:%x", sum)

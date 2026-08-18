@@ -189,6 +189,30 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		listeners = append(listeners, tls.NewListener(listener, server.TLSConfig))
 	}
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
+	probeContext, stopProbing := context.WithCancel(ctx)
+	var probeMu sync.Mutex
+	var probeGroup sync.WaitGroup
+	probesStopping := false
+	probeOutput := &lockedWriter{writer: output}
+	launchProbe := func(configuration config.Config) {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		if probesStopping {
+			return
+		}
+		probeGroup.Add(1)
+		go func() {
+			defer probeGroup.Done()
+			probeProviders(probeContext, configuration, probeOutput)
+		}()
+	}
+	defer func() {
+		probeMu.Lock()
+		probesStopping = true
+		stopProbing()
+		probeMu.Unlock()
+		probeGroup.Wait()
+	}()
 	var reloadMu sync.Mutex
 	localControl, err := control.Start(loaded.DataDir, control.Callbacks{
 		Status: func() control.Status {
@@ -209,6 +233,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 				return err
 			}
 			backend.Replace(replacement)
+			launchProbe(candidate)
 			return nil
 		},
 		Stop: func(_ context.Context, force bool) error {
@@ -234,6 +259,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	defer localControl.Close()
 	fmt.Fprintf(output, "DRG 已启动：%s\n", strings.Join(loaded.Server.Listeners, ", "))
 	fmt.Fprintln(output, "本地控制面已就绪：可使用 drg status、drg reload、drg stop。")
+	launchProbe(loaded)
 
 	serveErrors := make(chan error, len(listeners))
 	var group sync.WaitGroup
@@ -259,6 +285,56 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		group.Wait()
 		return 0
 	}
+}
+
+func probeProviders(parent context.Context, loaded config.Config, output io.Writer) {
+	for _, configured := range loaded.Providers {
+		if parent.Err() != nil {
+			return
+		}
+		probeContext, cancel := context.WithTimeout(parent, 15*time.Second)
+		username, password, err := configured.Auth.Credentials()
+		if err == nil {
+			var client *provider.Client
+			client, err = provider.New(provider.Options{
+				URL:      configured.URL,
+				Username: username,
+				Password: password,
+				CAFile:   configured.CAFile,
+			})
+			if err == nil {
+				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
+				if probeErr == nil {
+					if result.RangeSupported {
+						fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", configured.Name)
+					} else if loaded.AllowNonRangeProviders {
+						fmt.Fprintf(output, "Provider %s 准入探测通过但不支持 Range：仅作为降级下载源。\n", configured.Name)
+					} else {
+						fmt.Fprintf(output, "Provider %s 准入探测不通过：不支持 Range，当前配置已禁用无 Range Provider。\n", configured.Name)
+					}
+					cancel()
+					continue
+				}
+				err = probeErr
+			}
+		}
+		cancel()
+		if parent.Err() != nil {
+			return
+		}
+		fmt.Fprintf(output, "Provider %s 初始准入探测失败：%v；服务将继续运行并在后续拉取中恢复。\n", configured.Name, err)
+	}
+}
+
+type lockedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (writer *lockedWriter) Write(contents []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writer.Write(contents)
 }
 
 func buildRouter(loaded config.Config, salt []byte) (*router.Router, error) {

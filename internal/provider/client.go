@@ -44,6 +44,13 @@ type Client struct {
 	tokens map[string]string
 }
 
+// ProbeResult summarizes the non-destructive admission check for a Provider.
+type ProbeResult struct {
+	ManifestDigest string
+	BlobDigest     string
+	RangeSupported bool
+}
+
 // New builds a Provider client without inheriting HTTP_PROXY or HTTPS_PROXY.
 func New(options Options) (*Client, error) {
 	baseURL, err := url.Parse(strings.TrimRight(strings.TrimSpace(options.URL), "/"))
@@ -84,6 +91,61 @@ func New(options Options) (*Client, error) {
 		http:     client,
 		tokens:   make(map[string]string),
 	}, nil
+}
+
+// Probe verifies Registry V2 reachability, resolves one configured probe
+// image, and tests whether a blob honors a one-byte Range request. It never
+// downloads an entire layer.
+func (client *Client) Probe(ctx context.Context, reference string) (ProbeResult, error) {
+	response, err := client.request(ctx, http.MethodGet, client.registryURL("/v2/"), "", nil)
+	if err != nil {
+		return ProbeResult{}, err
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return ProbeResult{}, mapStatus(response.StatusCode)
+	}
+	repository, tagOrDigest, err := splitProbeReference(reference)
+	if err != nil {
+		return ProbeResult{}, err
+	}
+	manifest, err := client.Manifest(ctx, repository, tagOrDigest, probeMediaTypes)
+	if err != nil {
+		return ProbeResult{}, err
+	}
+	for depth := 0; depth < 2; depth++ {
+		blobDigest, nestedReference, err := probeBlobDigest(manifest.Content)
+		if err != nil {
+			return ProbeResult{}, err
+		}
+		if nestedReference != "" {
+			manifest, err = client.Manifest(ctx, repository, nestedReference, probeMediaTypes)
+			if err != nil {
+				return ProbeResult{}, err
+			}
+			continue
+		}
+		blob, err := client.Blob(ctx, repository, blobDigest, "bytes=0-0")
+		if err != nil {
+			if errors.Is(err, registry.ErrUnavailable) {
+				return ProbeResult{ManifestDigest: manifest.Digest, BlobDigest: blobDigest, RangeSupported: false}, nil
+			}
+			return ProbeResult{}, err
+		}
+		defer blob.Reader.Close()
+		if _, err := io.Copy(io.Discard, io.LimitReader(blob.Reader, 1)); err != nil {
+			return ProbeResult{}, fmt.Errorf("read probe range: %w", err)
+		}
+		return ProbeResult{ManifestDigest: manifest.Digest, BlobDigest: blobDigest, RangeSupported: true}, nil
+	}
+	return ProbeResult{}, errors.New("probe image index nesting exceeds supported depth")
+}
+
+var probeMediaTypes = []string{
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
 }
 
 // Manifest obtains selected manifest or index bytes while preserving upstream
@@ -243,7 +305,9 @@ func (client *Client) obtainToken(ctx context.Context, challenge, scope string) 
 	if service := parameters["service"]; service != "" {
 		query.Set("service", service)
 	}
-	query.Set("scope", scope)
+	if scope != "" {
+		query.Set("scope", scope)
+	}
 	realm.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
 	if err != nil {
@@ -384,4 +448,50 @@ func mapStatus(status int) error {
 		return registry.ErrNotFound
 	}
 	return registry.ErrUnavailable
+}
+
+func splitProbeReference(reference string) (string, string, error) {
+	value := strings.TrimSpace(reference)
+	if value == "" {
+		return "", "", errors.New("probe reference is required")
+	}
+	if repository, digest, found := strings.Cut(value, "@"); found {
+		if repository == "" || digest == "" {
+			return "", "", errors.New("probe digest reference is invalid")
+		}
+		return repository, digest, nil
+	}
+	lastSlash := strings.LastIndex(value, "/")
+	lastColon := strings.LastIndex(value, ":")
+	if lastColon > lastSlash {
+		return value[:lastColon], value[lastColon+1:], nil
+	}
+	return value, "latest", nil
+}
+
+func probeBlobDigest(contents []byte) (string, string, error) {
+	var document struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(contents, &document); err != nil {
+		return "", "", fmt.Errorf("decode probe manifest: %w", err)
+	}
+	if len(document.Manifests) > 0 && document.Manifests[0].Digest != "" {
+		return "", document.Manifests[0].Digest, nil
+	}
+	if document.Config.Digest != "" {
+		return document.Config.Digest, "", nil
+	}
+	if len(document.Layers) > 0 && document.Layers[0].Digest != "" {
+		return document.Layers[0].Digest, "", nil
+	}
+	return "", "", errors.New("probe manifest contains no blob descriptor")
 }
