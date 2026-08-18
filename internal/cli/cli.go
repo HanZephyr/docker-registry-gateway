@@ -154,6 +154,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintln(errorOutput, "当前首版 serve 仅支持 local_ca: true")
 		return 1
 	}
+	printSecurityWarnings(output, loaded)
 
 	absConfigPath, err := filepath.Abs(*configPath)
 	if err != nil {
@@ -574,6 +575,7 @@ func runStart(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	if exitCode != 0 {
 		return exitCode
 	}
+	printSecurityWarnings(output, loaded)
 	probeContext, cancel := context.WithTimeout(ctx, time.Second)
 	_, statusErr := control.StatusRequest(probeContext, loaded.DataDir)
 	cancel()
@@ -815,7 +817,8 @@ func runConfig(arguments []string, output, errorOutput io.Writer) int {
 		fmt.Fprintln(errorOutput, "config validate 不接受位置参数")
 		return 2
 	}
-	if _, err := config.LoadFile(*configPath); err != nil {
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
 		return 1
 	}
@@ -824,7 +827,14 @@ func runConfig(arguments []string, output, errorOutput io.Writer) int {
 		absPath = *configPath
 	}
 	fmt.Fprintf(output, "配置有效：%s\n", absPath)
+	printSecurityWarnings(output, loaded)
 	return 0
+}
+
+func printSecurityWarnings(output io.Writer, loaded config.Config) {
+	for _, warning := range loaded.SecurityWarnings() {
+		fmt.Fprintf(output, "[高优先级安全警告] %s\n", warning.Message)
+	}
 }
 
 func runOnboard(ctx context.Context, arguments []string, input io.Reader, output, errorOutput io.Writer) int {

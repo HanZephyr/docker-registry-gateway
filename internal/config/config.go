@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +77,59 @@ type Auth struct {
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
 	SecretFile string `yaml:"secret_file"`
+}
+
+// SecurityWarning describes a non-blocking configuration risk. DRG reports
+// these before startup but never substitutes product policy for deployment
+// decisions such as deliberately exposing a Gateway to a private network.
+type SecurityWarning struct {
+	Code    string
+	Message string
+}
+
+// SecurityWarnings returns all high-priority configuration risks without
+// including authentication material or file contents.
+func (value Config) SecurityWarnings() []SecurityWarning {
+	var warnings []SecurityWarning
+	hasCredentials := false
+	for _, provider := range value.Providers {
+		if provider.Auth.Password != "" {
+			warnings = append(warnings, SecurityWarning{Code: "plaintext_provider_password", Message: fmt.Sprintf("Provider %q 在主配置中使用明文 password，建议改用 secret_file", provider.Name)})
+		}
+		if provider.Auth.Password != "" || provider.Auth.SecretFile != "" {
+			hasCredentials = true
+		}
+		if provider.AllowInsecureHTTP {
+			warnings = append(warnings, SecurityWarning{Code: "insecure_provider_http", Message: fmt.Sprintf("Provider %q 已启用不安全 HTTP 上游", provider.Name)})
+		}
+		if provider.Auth.SecretFile != "" && runtime.GOOS != "windows" {
+			if info, err := os.Stat(provider.Auth.SecretFile); err == nil && info.Mode().Perm()&0o077 != 0 {
+				warnings = append(warnings, SecurityWarning{Code: "provider_secret_permissions", Message: fmt.Sprintf("Provider %q 的 secret_file 权限允许其他用户读取", provider.Name)})
+			}
+		}
+	}
+	if hasCredentials && hasNonLoopbackListener(value.Server.Listeners) {
+		warnings = append(warnings, SecurityWarning{Code: "credentialed_public_listener", Message: "Gateway 监听非回环地址且已配置 Provider 凭据；请确保网络边界和主机访问控制符合预期"})
+	}
+	return warnings
+}
+
+func hasNonLoopbackListener(listeners []string) bool {
+	for _, listener := range listeners {
+		host, _, err := net.SplitHostPort(listener)
+		if err != nil {
+			return true
+		}
+		host = strings.Trim(host, "[]")
+		if host == "localhost" {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Credentials returns the Provider credentials without exposing the source of

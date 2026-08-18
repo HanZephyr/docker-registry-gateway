@@ -101,6 +101,33 @@ allow_non_range_providers: true
 	}
 }
 
+func TestSecurityWarningsExposeDeploymentRisksWithoutBlocking(t *testing.T) {
+	t.Parallel()
+	loaded, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [0.0.0.0:5443]
+  tls:
+    local_ca: true
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: insecure
+    url: http://mirror.example.test
+    allow_insecure_http: true
+    resolver: true
+    pull_provider: true
+    auth:
+      username: user
+      password: pass
+`))
+	if err != nil {
+		t.Fatalf("config.Load() error = %v", err)
+	}
+	if got := len(loaded.SecurityWarnings()); got != 3 {
+		t.Errorf("warning count = %d, want 3", got)
+	}
+}
+
 func TestLoadRejectsAmbiguousCredentials(t *testing.T) {
 	t.Parallel()
 
