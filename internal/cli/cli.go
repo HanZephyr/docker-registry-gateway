@@ -727,6 +727,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	var probeMu sync.Mutex
 	var probeGroup sync.WaitGroup
 	probesStopping := false
+	probesRunning := false
 	probeOutput := &lockedWriter{writer: output}
 	persistHealth := func() {
 		if err := healthStore.Save(tracker.Snapshot()); err != nil {
@@ -754,15 +755,25 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		healthGroup.Wait()
 		persistHealth()
 	}()
+	mayProbe := func() bool {
+		return backend.ActivePulls() == 0 && backend.QueuedPulls() == 0 && !tracker.HasRecentPullActivity(providerProbeInterval)
+	}
 	launchProbe := func(configuration config.Config) {
 		probeMu.Lock()
-		defer probeMu.Unlock()
-		if probesStopping {
+		if probesStopping || probesRunning || !mayProbe() {
+			probeMu.Unlock()
 			return
 		}
+		probesRunning = true
 		probeGroup.Add(1)
+		probeMu.Unlock()
 		go func() {
-			defer probeGroup.Done()
+			defer func() {
+				probeMu.Lock()
+				probesRunning = false
+				probeMu.Unlock()
+				probeGroup.Done()
+			}()
 			probeProviders(probeContext, configuration, probeOutput, events, routeGuard, tracker)
 		}()
 	}
@@ -777,7 +788,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		reloadMu.Lock()
 		defer reloadMu.Unlock()
 		return currentConfig
-	}, launchProbe)
+	}, mayProbe, launchProbe)
 	defer stopPeriodicProbes()
 	localControl, err := control.Start(loaded.DataDir, control.Callbacks{
 		Status: func() control.Status {
@@ -948,8 +959,8 @@ func requireRangeProviderAdmission(parent context.Context, loaded config.Config,
 // an idle or previously unavailable Provider can recover without waiting for a
 // user pull. The current configuration is fetched on every tick, which keeps
 // successful hot reloads visible without mutating in-flight transfers.
-func startPeriodicProviderProbes(parent context.Context, interval time.Duration, current func() config.Config, launch func(config.Config)) func() {
-	if interval <= 0 || current == nil || launch == nil {
+func startPeriodicProviderProbes(parent context.Context, interval time.Duration, current func() config.Config, idle func() bool, launch func(config.Config)) func() {
+	if interval <= 0 || current == nil || idle == nil || launch == nil {
 		return func() {}
 	}
 	stopping := make(chan struct{})
@@ -974,7 +985,9 @@ func startPeriodicProviderProbes(parent context.Context, interval time.Duration,
 					return
 				default:
 				}
-				launch(current())
+				if idle() {
+					launch(current())
+				}
 			}
 		}
 	}()

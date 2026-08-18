@@ -371,6 +371,7 @@ func (router *Router) breakTie(repository, reference string, accepts []string, c
 // prematurely, its reader resumes from an untried Provider with a Range that
 // starts exactly after the bytes already delivered downstream.
 func (router *Router) Blob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
+	router.health.RecordPullActivity()
 	if rangeHeader == "" {
 		if blob, segmented := router.trySegmentedBlob(ctx, repository, digest); segmented {
 			return blob, nil

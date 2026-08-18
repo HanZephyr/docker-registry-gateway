@@ -14,8 +14,9 @@ const defaultRateLimitCooldown = time.Minute
 // It is intentionally advisory: all Providers remain eligible until a real
 // request proves otherwise, and static priority breaks cold-start ties.
 type Health struct {
-	mu     sync.RWMutex
-	states map[string]healthState
+	mu               sync.RWMutex
+	states           map[string]healthState
+	lastPullActivity time.Time
 }
 
 type healthState struct {
@@ -87,6 +88,7 @@ func (health *Health) RecordFirstByte(provider string, elapsed time.Duration) {
 	}
 	health.mu.Lock()
 	defer health.mu.Unlock()
+	health.lastPullActivity = time.Now().UTC()
 	state := health.states[provider]
 	if state.hasFirstByte {
 		state.firstByte = time.Duration(float64(state.firstByte)*0.7 + float64(elapsed)*0.3)
@@ -95,6 +97,30 @@ func (health *Health) RecordFirstByte(provider string, elapsed time.Duration) {
 		state.hasFirstByte = true
 	}
 	health.states[provider] = state
+}
+
+// RecordPullActivity marks a real downstream blob request. Provider probes do
+// not call this method, which lets the process distinguish user traffic from
+// maintenance traffic when deciding whether an active probe may run.
+func (health *Health) RecordPullActivity() {
+	if health == nil {
+		return
+	}
+	health.mu.Lock()
+	health.lastPullActivity = time.Now().UTC()
+	health.mu.Unlock()
+}
+
+// HasRecentPullActivity reports whether a real downstream pull was observed
+// during the supplied quiet period.
+func (health *Health) HasRecentPullActivity(quietPeriod time.Duration) bool {
+	if health == nil || quietPeriod <= 0 {
+		return false
+	}
+	health.mu.RLock()
+	last := health.lastPullActivity
+	health.mu.RUnlock()
+	return !last.IsZero() && last.After(time.Now().UTC().Add(-quietPeriod))
 }
 
 // RecordFailure lowers the Provider before later requests try it again.

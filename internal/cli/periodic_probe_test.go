@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,11 +19,13 @@ func TestPeriodicProviderProbesUseLatestConfigurationAndStop(t *testing.T) {
 	var configurationMu sync.RWMutex
 	configuration := config.Config{ProbeRef: "first"}
 	launched := make(chan string)
+	var idle atomic.Bool
+	idle.Store(true)
 	stop := startPeriodicProviderProbes(ctx, 10*time.Millisecond, func() config.Config {
 		configurationMu.RLock()
 		defer configurationMu.RUnlock()
 		return configuration
-	}, func(current config.Config) {
+	}, func() bool { return idle.Load() }, func(current config.Config) {
 		launched <- current.ProbeRef
 	})
 
@@ -51,6 +54,33 @@ func TestPeriodicProviderProbesUseLatestConfigurationAndStop(t *testing.T) {
 	case got := <-launched:
 		t.Fatalf("probe %q launched after stop", got)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestPeriodicProviderProbesWaitForAnIdleGateway(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var idle atomic.Bool
+	launched := make(chan struct{}, 1)
+	stop := startPeriodicProviderProbes(ctx, 10*time.Millisecond, func() config.Config {
+		return config.Config{}
+	}, func() bool { return idle.Load() }, func(config.Config) {
+		launched <- struct{}{}
+	})
+	defer stop()
+
+	select {
+	case <-launched:
+		t.Fatal("probe launched while a real pull was active or recently active")
+	case <-time.After(30 * time.Millisecond):
+	}
+	idle.Store(true)
+	select {
+	case <-launched:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not launch after the gateway became idle")
 	}
 }
 
