@@ -48,6 +48,9 @@ allow_non_range_providers: true
 	if got, want := loaded.Resources.MaxNoRangeRestartDiscard, "64MiB"; got != want {
 		t.Errorf("max_no_range_restart_discard default = %q, want %q", got, want)
 	}
+	if got, want := loaded.Retention.EventRetention, "168h"; got != want {
+		t.Errorf("event retention default = %q, want %q", got, want)
+	}
 }
 
 func TestLoadFileResolvesProviderSecretFileAndValidatesPriority(t *testing.T) {
@@ -363,5 +366,29 @@ providers:
 `))
 	if err == nil || !strings.Contains(err.Error(), "at least one role") {
 		t.Fatalf("config.Load() error = %v, want role rejection", err)
+	}
+}
+
+func TestLoadRejectsInvalidDiagnosticRetention(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+retention:
+  event_retention: never
+  event_max_bytes: 0MiB
+  health_retention: 0s
+`))
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("config.Load() error = %v, want invalid retention rejection", err)
 	}
 }

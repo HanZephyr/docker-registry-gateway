@@ -448,9 +448,14 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	}
 	routeGuard := routeguard.New(instanceID, 3)
 
+	eventRetention, healthRetention, err := retentionConfiguration(loaded)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取诊断文件保留配置失败: %v\n", err)
+		return 1
+	}
 	tracker := router.NewHealth()
-	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now)
-	if snapshots, loadErr := healthStore.Load(healthhistory.Retention); loadErr != nil {
+	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now, healthRetention)
+	if snapshots, loadErr := healthStore.Load(healthRetention); loadErr != nil {
 		fmt.Fprintf(errorOutput, "读取 Provider 健康历史失败，将以空历史启动: %v\n", loadErr)
 	} else {
 		tracker.Restore(snapshots)
@@ -461,7 +466,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		return 1
 	}
 	tempBudget := router.NewTempBudget(temporaryDiskQuota)
-	events := eventlog.New(loaded.DataDir, time.Now)
+	events := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	eventObserver := router.ObserverFunc(func(event router.Event) {
 		_ = events.Write(eventlog.Event{
 			Level:      event.Level,
@@ -821,6 +826,22 @@ func sameServeConfiguration(current, candidate config.Config) bool {
 func externalInstanceID(dataDir string) string {
 	sum := sha256.Sum256([]byte(filepath.Clean(dataDir)))
 	return fmt.Sprintf("drg:%x", sum[:])
+}
+
+func retentionConfiguration(loaded config.Config) (eventlog.Options, time.Duration, error) {
+	eventRetention, err := time.ParseDuration(loaded.Retention.EventRetention)
+	if err != nil || eventRetention <= 0 {
+		return eventlog.Options{}, 0, errors.New("event_retention must be a positive Go duration")
+	}
+	eventMaxBytes, err := config.ParseByteSize(loaded.Retention.EventMaxBytes)
+	if err != nil || eventMaxBytes <= 0 {
+		return eventlog.Options{}, 0, errors.New("event_max_bytes must be a positive byte quantity")
+	}
+	healthRetention, err := time.ParseDuration(loaded.Retention.HealthRetention)
+	if err != nil || healthRetention <= 0 {
+		return eventlog.Options{}, 0, errors.New("health_retention must be a positive Go duration")
+	}
+	return eventlog.Options{Retention: eventRetention, MaxBytes: eventMaxBytes}, healthRetention, nil
 }
 
 func admissionConfigurationChanged(current, candidate config.Config) bool {
@@ -1283,7 +1304,12 @@ func runEvents(arguments []string, output, errorOutput io.Writer) int {
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
 		return 1
 	}
-	events, err := eventlog.New(loaded.DataDir, time.Now).Read(*limit)
+	eventRetention, _, err := retentionConfiguration(loaded)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取事件日志保留配置失败: %v\n", err)
+		return 1
+	}
+	events, err := eventlog.New(loaded.DataDir, time.Now, eventRetention).Read(*limit)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "读取事件日志失败: %v\n", err)
 		return 1

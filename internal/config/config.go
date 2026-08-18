@@ -28,6 +28,7 @@ type Config struct {
 	Resolution                      Resolution `yaml:"resolution"`
 	ProbeRef                        string     `yaml:"probe_ref"`
 	Resources                       Resources  `yaml:"resources"`
+	Retention                       Retention  `yaml:"retention"`
 	AllowNonRangeProviders          bool       `yaml:"-"`
 	AllowNonRangeProvidersSpecified *bool      `yaml:"allow_non_range_providers"`
 }
@@ -43,6 +44,14 @@ type Resources struct {
 	MaxInflightRequests      int    `yaml:"max_inflight_requests"`
 	MaxQueuedPulls           int    `yaml:"max_queued_pulls"`
 	TempDir                  string `yaml:"temp_dir"`
+}
+
+// Retention configures bounded, file-backed diagnostics without introducing a
+// database. Durations use Go duration syntax, for example 168h.
+type Retention struct {
+	EventRetention  string `yaml:"event_retention"`
+	EventMaxBytes   string `yaml:"event_max_bytes"`
+	HealthRetention string `yaml:"health_retention"`
 }
 
 // Server configures downstream Registry listeners.
@@ -215,10 +224,23 @@ func (value *Config) applyDefaults() {
 		value.ProbeRef = "library/busybox:latest"
 	}
 	value.Resources.applyDefaults()
+	value.Retention.applyDefaults()
 	if value.AllowNonRangeProvidersSpecified == nil {
 		value.AllowNonRangeProviders = true
 	} else {
 		value.AllowNonRangeProviders = *value.AllowNonRangeProvidersSpecified
+	}
+}
+
+func (retention *Retention) applyDefaults() {
+	if retention.EventRetention == "" {
+		retention.EventRetention = "168h"
+	}
+	if retention.EventMaxBytes == "" {
+		retention.EventMaxBytes = "100MiB"
+	}
+	if retention.HealthRetention == "" {
+		retention.HealthRetention = "168h"
 	}
 }
 
@@ -288,6 +310,9 @@ func (value Config) Validate() error {
 	if err := validateResources(value.Resources); err != nil {
 		return err
 	}
+	if err := validateRetention(value.Retention); err != nil {
+		return err
+	}
 	if strings.TrimSpace(value.ProbeRef) == "" {
 		return errors.New("probe_ref is required")
 	}
@@ -313,6 +338,22 @@ func validateResources(resources Resources) error {
 		if _, err := ParseByteSize(value); err != nil {
 			return fmt.Errorf("resources %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+func validateRetention(retention Retention) error {
+	for name, value := range map[string]string{
+		"event_retention":  retention.EventRetention,
+		"health_retention": retention.HealthRetention,
+	} {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return fmt.Errorf("retention %s must be a positive Go duration", name)
+		}
+	}
+	if size, err := ParseByteSize(retention.EventMaxBytes); err != nil || size <= 0 {
+		return errors.New("retention event_max_bytes must be a positive byte quantity")
 	}
 	return nil
 }

@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	retention = 7 * 24 * time.Hour
-	maxBytes  = int64(100 << 20)
+	defaultRetention = 7 * 24 * time.Hour
+	defaultMaxBytes  = int64(100 << 20)
 )
 
 // Event intentionally excludes headers, credentials, tokens and redirect URLs.
@@ -35,14 +35,31 @@ type Event struct {
 type Log struct {
 	directory string
 	now       func() time.Time
+	retention time.Duration
+	maxBytes  int64
 	mu        sync.Mutex
 }
 
-func New(dataDir string, now func() time.Time) *Log {
+// Options configures bounded local event retention.
+type Options struct {
+	Retention time.Duration
+	MaxBytes  int64
+}
+
+func New(dataDir string, now func() time.Time, options ...Options) *Log {
 	if now == nil {
 		now = time.Now
 	}
-	return &Log{directory: filepath.Join(dataDir, "events"), now: now}
+	configured := Options{Retention: defaultRetention, MaxBytes: defaultMaxBytes}
+	if len(options) > 0 {
+		if options[0].Retention > 0 {
+			configured.Retention = options[0].Retention
+		}
+		if options[0].MaxBytes > 0 {
+			configured.MaxBytes = options[0].MaxBytes
+		}
+	}
+	return &Log{directory: filepath.Join(dataDir, "events"), now: now, retention: configured.Retention, maxBytes: configured.MaxBytes}
 }
 
 func (log *Log) Write(event Event) error {
@@ -93,7 +110,7 @@ func (log *Log) cleanupLocked(incoming int64) error {
 	}
 	var files []fileInfo
 	var total int64
-	cutoff := log.now().Add(-retention)
+	cutoff := log.now().Add(-log.retention)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
@@ -112,7 +129,7 @@ func (log *Log) cleanupLocked(incoming int64) error {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].modified.Before(files[j].modified) })
 	for _, file := range files {
-		if total+incoming <= maxBytes {
+		if total+incoming <= log.maxBytes {
 			break
 		}
 		if err := os.Remove(file.path); err != nil {

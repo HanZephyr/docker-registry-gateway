@@ -16,15 +16,16 @@ import (
 
 const (
 	fileVersion = 1
-	// Retention is the fixed V1 provider-health history window. It is kept
-	// intentionally short so the file remains a diagnostic aid, not a database.
+	// Retention is the default provider-health history window. Deployments may
+	// override it through their bounded file-retention configuration.
 	Retention = 7 * 24 * time.Hour
 )
 
 // Store owns one atomically-updated health-history file.
 type Store struct {
-	path string
-	now  func() time.Time
+	path      string
+	now       func() time.Time
+	retention time.Duration
 }
 
 type persistedFile struct {
@@ -34,11 +35,15 @@ type persistedFile struct {
 
 // Open constructs a Store. The parent directory is made only when saving, so
 // read-only CLI status checks do not mutate the filesystem.
-func Open(path string, now func() time.Time) *Store {
+func Open(path string, now func() time.Time, retention ...time.Duration) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{path: path, now: now}
+	configuredRetention := Retention
+	if len(retention) > 0 && retention[0] > 0 {
+		configuredRetention = retention[0]
+	}
+	return &Store{path: path, now: now, retention: configuredRetention}
 }
 
 // Load returns snapshots observed within retention. A malformed file is
@@ -60,6 +65,9 @@ func (store *Store) Load(retention time.Duration) ([]router.HealthSnapshot, erro
 	}
 	if persisted.Version != fileVersion {
 		return nil, fmt.Errorf("unsupported provider health history version %d", persisted.Version)
+	}
+	if retention <= 0 {
+		retention = store.retention
 	}
 	cutoff := store.now().Add(-retention)
 	result := make([]router.HealthSnapshot, 0, len(persisted.Providers))
@@ -84,7 +92,7 @@ func (store *Store) Save(snapshots []router.HealthSnapshot) error {
 		return nil
 	}
 	providers := make([]router.HealthSnapshot, 0, len(snapshots))
-	cutoff := store.now().Add(-Retention)
+	cutoff := store.now().Add(-store.retention)
 	for _, snapshot := range snapshots {
 		if snapshot.Provider == "" || snapshot.ThroughputBytesPerSecond < 0 || !observedSince(snapshot, cutoff) {
 			continue

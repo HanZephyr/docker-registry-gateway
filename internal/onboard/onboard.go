@@ -165,6 +165,10 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string, addition
 	builder.WriteString("  max_no_range_restart_discard: " + yamlScalar(resources.MaxNoRangeRestartDiscard) + "\n")
 	builder.WriteString(fmt.Sprintf("  max_inflight_requests: %d\n", resources.MaxInflightRequests))
 	builder.WriteString(fmt.Sprintf("  max_queued_pulls: %d\n", resources.MaxQueuedPulls))
+	builder.WriteString("\nretention:\n")
+	builder.WriteString("  event_retention: 168h\n")
+	builder.WriteString("  event_max_bytes: 100MiB\n")
+	builder.WriteString("  health_retention: 168h\n")
 	return builder.String()
 }
 
