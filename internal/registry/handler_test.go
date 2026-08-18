@@ -109,8 +109,12 @@ func TestHandlerAbortsFullBlobResponseWhenDigestDoesNotMatch(t *testing.T) {
 
 func TestHandlerRejectsGatewayRouteThatReturnsToThisInstance(t *testing.T) {
 	backend := &countingBackend{}
+	var events []registry.HandlerEvent
 	handler := registry.NewHandlerWithOptions(backend, registry.HandlerOptions{
 		RouteGuard: routeguard.New("gateway-a", 3),
+		OnEvent: func(event registry.HandlerEvent) {
+			events = append(events, event)
+		},
 	})
 	request := httptest.NewRequest(http.MethodGet, "https://drg.localhost:5443/v2/library/nginx/manifests/latest", nil)
 	request.Header.Set(routeguard.InstanceHeader, "gateway-a")
@@ -124,6 +128,9 @@ func TestHandlerRejectsGatewayRouteThatReturnsToThisInstance(t *testing.T) {
 	}
 	if backend.calls != 0 {
 		t.Errorf("backend calls = %d, want no routing after loop rejection", backend.calls)
+	}
+	if len(events) != 1 || events[0].Code != "routing_loop_detected" {
+		t.Errorf("events = %#v, want routing-loop event", events)
 	}
 }
 
@@ -139,6 +146,24 @@ func TestHandlerReturnsProviderRateLimitToDockerWithRetryHint(t *testing.T) {
 	}
 	if got, want := response.Header().Get("Retry-After"), "15"; got != want {
 		t.Errorf("Retry-After = %q, want %q", got, want)
+	}
+}
+
+func TestHandlerEmitsBestEffortRoutingNoticeAsWarning(t *testing.T) {
+	manifest := []byte(`{"schemaVersion":2}`)
+	handler := registry.NewHandler(fakeBackend{manifest: registry.Manifest{
+		MediaType: "application/vnd.oci.image.manifest.v1+json",
+		Digest:    digest(manifest),
+		Content:   manifest,
+		Notice:    "DRG resolver conflict selected sha256:stable",
+	}})
+	request := httptest.NewRequest(http.MethodGet, "https://drg.localhost:5443/v2/library/nginx/manifests/latest", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if got, want := response.Header().Get("Warning"), `299 drg "DRG resolver conflict selected sha256:stable"`; got != want {
+		t.Errorf("Warning = %q, want %q", got, want)
 	}
 }
 

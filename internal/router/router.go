@@ -25,6 +25,27 @@ type Source struct {
 	Backend      registry.Backend
 }
 
+// Event is a non-secret routing observation for the local event log. It never
+// contains credentials, headers, or Provider redirect URLs.
+type Event struct {
+	Level      string
+	Code       string
+	Provider   string
+	Repository string
+	Reference  string
+	Digest     string
+	Message    string
+}
+
+// Observer receives routing events synchronously. Callers should make the
+// implementation bounded and non-blocking enough for a pull hot path.
+type Observer interface{ Observe(Event) }
+
+// ObserverFunc adapts a function into a routing Event observer.
+type ObserverFunc func(Event)
+
+func (function ObserverFunc) Observe(event Event) { function(event) }
+
 // Options controls deterministic conflict selection.
 type Options struct {
 	ConflictStrategy         string
@@ -39,6 +60,7 @@ type Options struct {
 	MaxNoRangeRestartDiscard int64
 	DecisionLease            time.Duration
 	LeaseStore               *lease.Store
+	Observer                 Observer
 }
 
 // Router implements the downstream Registry backend using multiple Providers.
@@ -56,6 +78,7 @@ type Router struct {
 	minSegmentSize           int64
 	temporaryDir             string
 	tempBudget               *TempBudget
+	observer                 Observer
 }
 
 // New creates a Router. Configuration validation guarantees sources contain
@@ -99,6 +122,7 @@ func New(sources []Source, options Options) *Router {
 		minSegmentSize:           options.MinSegmentSize,
 		temporaryDir:             options.TemporaryDir,
 		tempBudget:               options.TempBudget,
+		observer:                 options.Observer,
 	}
 }
 
@@ -112,6 +136,7 @@ func (router *Router) Manifest(ctx context.Context, repository, reference string
 	key := leaseKey(repository, reference, accepts)
 	if router.leaseStore != nil && router.decisionLease > 0 {
 		if digest, found, err := router.leaseStore.Get(key, time.Now()); err == nil && found {
+			router.emit(Event{Level: "info", Code: "decision_lease_used", Repository: repository, Reference: reference, Digest: digest, Message: "reused the existing resolver decision lease"})
 			return router.pullManifest(ctx, repository, digest, accepts)
 		}
 	}
@@ -123,6 +148,7 @@ func (router *Router) Manifest(ctx context.Context, repository, reference string
 	if err != nil {
 		return registry.Manifest{}, err
 	}
+	manifest.Notice = selection.Notice
 	if router.leaseStore != nil && router.decisionLease > 0 {
 		// A disk error must not turn a successful pull into an unavailable
 		// response. The current process still has the selected immutable
@@ -204,16 +230,43 @@ func (router *Router) resolveManifest(ctx context.Context, repository, reference
 		}
 		return ordered[left].manifest.Digest < ordered[right].manifest.Digest
 	})
+	if len(ordered) > 1 {
+		router.emit(Event{
+			Level:      "warning",
+			Code:       "resolver_conflict",
+			Repository: repository,
+			Reference:  reference,
+			Message:    fmt.Sprintf("%d resolvers returned %d different manifest digests", successful, len(ordered)),
+		})
+	}
+	var selected registry.Manifest
 	if router.conflictStrategy == "provider_priority" {
-		if manifest, found := router.byProviderPriority(ordered); found {
-			return manifest, nil
+		manifest, found := router.byProviderPriority(ordered)
+		if !found {
+			return registry.Manifest{}, registry.ErrUnavailable
 		}
-		return registry.Manifest{}, registry.ErrUnavailable
+		selected = manifest
+	} else if len(ordered[0].indexes) > successful/2 {
+		selected = ordered[0].manifest
+	} else {
+		manifest, err := router.breakTie(repository, reference, accepts, ordered)
+		if err != nil {
+			return registry.Manifest{}, err
+		}
+		selected = manifest
 	}
-	if len(ordered[0].indexes) > successful/2 {
-		return ordered[0].manifest, nil
+	if len(ordered) > 1 {
+		selected.Notice = fmt.Sprintf("DRG resolver conflict selected %s using %s", selected.Digest, router.conflictStrategy)
 	}
-	return router.breakTie(repository, reference, accepts, ordered)
+	router.emit(Event{
+		Level:      "info",
+		Code:       "resolution_selected",
+		Repository: repository,
+		Reference:  reference,
+		Digest:     selected.Digest,
+		Message:    "resolver decision selected an immutable manifest digest",
+	})
+	return selected, nil
 }
 
 func (router *Router) pullManifest(ctx context.Context, repository, digest string, accepts []string) (registry.Manifest, error) {
@@ -225,6 +278,7 @@ func (router *Router) pullManifest(ctx context.Context, repository, digest strin
 			continue
 		}
 		if strings.EqualFold(manifest.Digest, digest) && manifest.MediaType != "" {
+			router.emit(Event{Level: "info", Code: "manifest_source_selected", Provider: source.Name, Repository: repository, Digest: digest, Message: "pull provider returned the selected immutable manifest"})
 			return manifest, nil
 		}
 	}
@@ -318,8 +372,10 @@ func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHea
 		blob, err := source.Backend.Blob(ctx, repository, digest, rangeHeader)
 		if err == nil {
 			if !validInitialBlob(blob, digest) {
-				_ = blob.Reader.Close()
-				router.health.RecordFailure(source.Name)
+				if blob.Reader != nil {
+					_ = blob.Reader.Close()
+				}
+				router.recordSourceFailure(source.Name, registry.NewFailure(registry.FailureIntegrity, 0, errors.New("invalid initial blob metadata")))
 				allNotFound = false
 				continue
 			}
@@ -338,10 +394,11 @@ func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHea
 				end:         blob.End,
 				size:        blob.Size,
 			}
+			router.emit(Event{Level: "info", Code: "blob_source_selected", Provider: source.Name, Repository: repository, Digest: digest, Message: "pull provider opened a blob stream"})
 			return blob, nil
 		}
+		router.recordSourceFailure(source.Name, err)
 		if !errors.Is(err, registry.ErrNotFound) {
-			router.recordSourceFailure(source.Name, err)
 			allNotFound = false
 		}
 	}
@@ -417,12 +474,14 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 		rangeHeader := fmt.Sprintf("bytes=%d-%d", reader.offset, reader.end)
 		blob, err := source.Backend.Blob(reader.ctx, reader.repository, reader.digest, rangeHeader)
 		if err == nil && validResumedBlob(blob, reader.digest, reader.offset, reader.end, reader.size) {
+			previous := reader.currentName
 			reader.current = blob.Reader
 			reader.currentAt = index
 			reader.currentName = source.Name
 			reader.startedAt = time.Now()
 			reader.transferBytes = 0
 			reader.recorded = false
+			reader.router.emit(Event{Level: "warning", Code: "blob_source_switched", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, Message: fmt.Sprintf("resumed interrupted blob stream after switching from %s", previous)})
 			return reader.Read(buffer)
 		}
 		if blob.Reader != nil {
@@ -438,6 +497,7 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 						reader.startedAt = time.Now()
 						reader.transferBytes = 0
 						reader.recorded = false
+						reader.router.emit(Event{Level: "warning", Code: "blob_source_restarted_no_range", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, Message: "resumed by restarting a non-Range provider and discarding the already delivered prefix"})
 						return reader.Read(buffer)
 					}
 				}
@@ -456,18 +516,30 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 
 func (router *Router) recordSourceFailure(provider string, err error) {
 	if errors.Is(err, registry.ErrNotFound) {
+		router.emit(Event{Level: "info", Code: "provider_content_not_found", Provider: provider, Message: "provider does not currently contain the requested immutable content"})
 		return
 	}
 	switch {
 	case registry.IsFailureKind(err, registry.FailureRateLimited):
 		router.health.RecordRateLimited(provider, registry.RetryAfter(err))
+		router.emit(Event{Level: "warning", Code: "provider_rate_limited", Provider: provider, Message: "provider entered its upstream rate-limit cooldown"})
 	case registry.IsFailureKind(err, registry.FailureAuthentication):
 		router.health.RecordAuthenticationFailure(provider)
+		router.emit(Event{Level: "error", Code: "provider_authentication_invalid", Provider: provider, Message: "provider authentication failed after one token refresh"})
 	case registry.IsFailureKind(err, registry.FailureIntegrity):
 		router.health.RecordIntegrityViolation(provider)
+		router.emit(Event{Level: "error", Code: "provider_integrity_isolated", Provider: provider, Message: "provider content or metadata disagreed with the selected digest and was isolated"})
 	default:
 		router.health.RecordFailure(provider)
+		router.emit(Event{Level: "warning", Code: "provider_unavailable", Provider: provider, Message: "provider request failed temporarily"})
 	}
+}
+
+func (router *Router) emit(event Event) {
+	if router == nil || router.observer == nil {
+		return
+	}
+	router.observer.Observe(event)
 }
 
 func (reader *resumableBlobReader) recordSuccess() {

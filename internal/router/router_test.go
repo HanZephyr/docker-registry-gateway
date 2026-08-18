@@ -21,11 +21,14 @@ import (
 func TestManifestChoosesMajorityDigestAcrossResolvers(t *testing.T) {
 	t.Parallel()
 	majority := registry.Manifest{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: "sha256:majority", Content: []byte("majority")}
+	var events []router.Event
 	gateway := router.New([]router.Source{
 		{Name: "one", Resolver: true, PullProvider: true, Backend: fakeBackend{manifest: majority}},
 		{Name: "two", Resolver: true, PullProvider: true, Backend: fakeBackend{manifest: registry.Manifest{MediaType: majority.MediaType, Digest: "sha256:other", Content: []byte("other")}}},
 		{Name: "three", Resolver: true, PullProvider: true, Backend: fakeBackend{manifest: majority}},
-	}, router.Options{TieBreaker: "rendezvous_hash", Salt: []byte("test-salt")})
+	}, router.Options{TieBreaker: "rendezvous_hash", Salt: []byte("test-salt"), Observer: router.ObserverFunc(func(event router.Event) {
+		events = append(events, event)
+	})})
 
 	manifest, err := gateway.Manifest(context.Background(), "library/nginx", "latest", nil)
 	if err != nil {
@@ -34,6 +37,30 @@ func TestManifestChoosesMajorityDigestAcrossResolvers(t *testing.T) {
 	if got, want := manifest.Digest, majority.Digest; got != want {
 		t.Errorf("digest = %q, want majority %q", got, want)
 	}
+	if !strings.Contains(manifest.Notice, "resolver conflict") {
+		t.Errorf("manifest notice = %q, want conflict notice", manifest.Notice)
+	}
+	if !containsEventCode(events, "resolver_conflict") || !containsEvent(events, "resolution_selected", "sha256:majority") {
+		t.Errorf("events = %#v, want conflict and selected-digest events", events)
+	}
+}
+
+func containsEventCode(events []router.Event, code string) bool {
+	for _, event := range events {
+		if event.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEvent(events []router.Event, code, digest string) bool {
+	for _, event := range events {
+		if event.Code == code && event.Digest == digest {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManifestUsesLowestConfiguredResolverPriority(t *testing.T) {
@@ -91,10 +118,11 @@ func TestManifestLeaseKeepsTagOnTheSelectedDigest(t *testing.T) {
 
 func TestBlobFallsBackToNextPullProvider(t *testing.T) {
 	t.Parallel()
+	var events []router.Event
 	gateway := router.New([]router.Source{
 		{Name: "missing", PullProvider: true, Backend: fakeBackend{blobErr: registry.ErrNotFound}},
 		{Name: "available", PullProvider: true, Backend: fakeBackend{blob: registry.Blob{Digest: "sha256:blob", Size: 1, Start: 0, End: 0, Reader: ioNopCloser("x")}}},
-	}, router.Options{})
+	}, router.Options{Observer: router.ObserverFunc(func(event router.Event) { events = append(events, event) })})
 
 	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
 	if err != nil {
@@ -103,6 +131,9 @@ func TestBlobFallsBackToNextPullProvider(t *testing.T) {
 	defer blob.Reader.Close()
 	if got, want := blob.Digest, "sha256:blob"; got != want {
 		t.Errorf("digest = %q, want %q", got, want)
+	}
+	if !containsEventCode(events, "provider_content_not_found") || !containsEvent(events, "blob_source_selected", "sha256:blob") {
+		t.Errorf("events = %#v, want missing-provider and selected-source diagnostics", events)
 	}
 }
 

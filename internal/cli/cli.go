@@ -193,7 +193,19 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		return 1
 	}
 	tempBudget := router.NewTempBudget(temporaryDiskQuota)
-	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, routeGuard)
+	events := eventlog.New(loaded.DataDir, time.Now)
+	eventObserver := router.ObserverFunc(func(event router.Event) {
+		_ = events.Write(eventlog.Event{
+			Level:      event.Level,
+			Code:       event.Code,
+			Provider:   event.Provider,
+			Repository: event.Repository,
+			Reference:  event.Reference,
+			Digest:     event.Digest,
+			Message:    event.Message,
+		})
+	})
+	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, routeGuard, eventObserver)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
@@ -205,6 +217,9 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	server := &http.Server{
 		Handler: gateway.LimitRequests(registry.NewHandlerWithOptions(backend, registry.HandlerOptions{
 			RouteGuard: routeGuard,
+			OnEvent: func(event registry.HandlerEvent) {
+				_ = events.Write(eventlog.Event{Level: event.Level, Code: event.Code, Message: event.Message})
+			},
 		}), loaded.Resources.MaxInflightRequests),
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12},
 	}
@@ -224,7 +239,6 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
 	currentConfig := loaded
 	probeContext, stopProbing := context.WithCancel(ctx)
-	events := eventlog.New(loaded.DataDir, time.Now)
 	_ = events.Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway 已启动"})
 	var probeMu sync.Mutex
 	var probeGroup sync.WaitGroup
@@ -304,7 +318,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, routeGuard)
+			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, routeGuard, eventObserver)
 			if err != nil {
 				return err
 			}
@@ -417,7 +431,7 @@ func (writer *lockedWriter) Write(contents []byte) (int, error) {
 	return writer.writer.Write(contents)
 }
 
-func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget, routeGuard routeguard.Guard) (*router.Router, error) {
+func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget, routeGuard routeguard.Guard, observer router.Observer) (*router.Router, error) {
 	sources := make([]router.Source, 0, len(loaded.Providers))
 	for _, configured := range loaded.Providers {
 		username, password, err := configured.Auth.Credentials()
@@ -474,6 +488,7 @@ func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, temp
 		MinSegmentSize:           minSegmentSize,
 		TemporaryDir:             loaded.Resources.TempDir,
 		TempBudget:               tempBudget,
+		Observer:                 observer,
 	}), nil
 }
 

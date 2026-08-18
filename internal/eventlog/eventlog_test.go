@@ -13,7 +13,7 @@ func TestLogReadsNewestBoundedEvents(t *testing.T) {
 	if err := log.Write(Event{Level: "info", Code: "first", Message: "one"}); err != nil {
 		t.Fatalf("write first: %v", err)
 	}
-	if err := log.Write(Event{Level: "warning", Code: "second", Message: "two"}); err != nil {
+	if err := log.Write(Event{Level: "warning", Code: "second", Repository: "library/nginx", Reference: "latest", Digest: "sha256:stable", Message: "two"}); err != nil {
 		t.Fatalf("write second: %v", err)
 	}
 	events, err := log.Read(1)
@@ -22,5 +22,8 @@ func TestLogReadsNewestBoundedEvents(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Code != "second" {
 		t.Errorf("events = %#v, want newest second", events)
+	}
+	if got, want := events[0].Repository, "library/nginx"; got != want {
+		t.Errorf("repository = %q, want %q", got, want)
 	}
 }

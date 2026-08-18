@@ -39,6 +39,9 @@ type Manifest struct {
 	MediaType string
 	Digest    string
 	Content   []byte
+	// Notice is a best-effort, non-sensitive routing explanation for the
+	// downstream client. It is emitted as an HTTP Warning header only.
+	Notice string
 }
 
 // Blob is immutable config or layer bytes selected by the routing layer.
@@ -59,22 +62,36 @@ func NewHandler(backend Backend) http.Handler {
 // small downstream Registry pull surface.
 type HandlerOptions struct {
 	RouteGuard routeguard.Guard
+	OnEvent    func(HandlerEvent)
+}
+
+// HandlerEvent is a non-sensitive downstream HTTP observation. It remains
+// separate from router.Event so the Registry HTTP seam does not depend on a
+// concrete routing implementation.
+type HandlerEvent struct {
+	Level   string
+	Code    string
+	Message string
 }
 
 // NewHandlerWithOptions creates the HTTP pull API with Gateway-to-Gateway
 // routing protection enabled when RouteGuard has an instance identity.
 func NewHandlerWithOptions(backend Backend, options HandlerOptions) http.Handler {
-	return handler{backend: backend, routeGuard: options.RouteGuard}
+	return handler{backend: backend, routeGuard: options.RouteGuard, onEvent: options.OnEvent}
 }
 
 type handler struct {
 	backend    Backend
 	routeGuard routeguard.Guard
+	onEvent    func(HandlerEvent)
 }
 
 func (value handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	context, err := value.routeGuard.Inbound(request.Context(), request.Header)
 	if err != nil {
+		if value.onEvent != nil {
+			value.onEvent(HandlerEvent{Level: "error", Code: "routing_loop_detected", Message: "rejected a Gateway request that returned to this instance or exceeded the hop limit"})
+		}
 		writeOCIError(response, http.StatusServiceUnavailable, "UNAVAILABLE", "gateway routing loop detected")
 		return
 	}
@@ -132,10 +149,22 @@ func (value handler) serveManifest(response http.ResponseWriter, request *http.R
 	response.Header().Set("Content-Type", manifest.MediaType)
 	response.Header().Set("Docker-Content-Digest", manifest.Digest)
 	response.Header().Set("Content-Length", strconv.Itoa(len(manifest.Content)))
+	addPullNotice(response.Header(), manifest.Notice)
 	response.WriteHeader(http.StatusOK)
 	if request.Method == http.MethodGet {
 		_, _ = response.Write(manifest.Content)
 	}
+}
+
+func addPullNotice(headers http.Header, notice string) {
+	notice = strings.TrimSpace(notice)
+	if notice == "" {
+		return
+	}
+	// Warning is best-effort only, but it must never permit an internal routing
+	// explanation to create a second downstream HTTP header.
+	notice = strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\r", " ", "\n", " ").Replace(notice)
+	headers.Add("Warning", `299 drg "`+notice+`"`)
 }
 
 func (value handler) serveBlob(response http.ResponseWriter, request *http.Request, repository, digest string) {
