@@ -33,6 +33,7 @@ drg onboard
 
 ```powershell
 drg doctor --skip-providers       # 只读诊断配置、TLS、监听和 Docker daemon
+drg config migrate                # 检查是否需要迁移配置格式
 drg provider list
 drg provider add --name mirror-a --url https://example.invalid --pull-provider
 drg reload                         # 校验后热加载；仅影响新请求
