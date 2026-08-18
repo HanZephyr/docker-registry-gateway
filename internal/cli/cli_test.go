@@ -16,6 +16,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/cli"
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
+	"github.com/hjx/docker-registry-gateway/internal/eventlog"
 	"github.com/hjx/docker-registry-gateway/internal/lease"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
@@ -119,6 +120,43 @@ allow_non_range_providers: true
 	}
 	if !strings.Contains(output.String(), "配置有效") {
 		t.Errorf("stdout = %q, want validation success", output.String())
+	}
+}
+
+func TestRunEventsDisplaysNonSecretPullContext(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	if err := eventlog.New(dataDir, time.Now).Write(eventlog.Event{Level: "warning", Code: "blob_source_switched", Provider: "mirror-a", Repository: "library/nginx", Reference: "latest", Digest: "sha256:stable", Message: "resumed safely"}); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+	var output, errors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"events", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("events exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	for _, expected := range []string{"Provider=mirror-a", "Repository=library/nginx", "Reference=latest", "Digest=sha256:stable"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("events output lacks %q:\n%s", expected, output.String())
+		}
 	}
 }
 

@@ -1825,11 +1825,24 @@ func runEvents(arguments []string, output, errorOutput io.Writer) int {
 		return 0
 	}
 	for _, event := range events {
-		provider := ""
+		var details []string
 		if event.Provider != "" {
-			provider = " Provider=" + event.Provider
+			details = append(details, "Provider="+event.Provider)
 		}
-		fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, provider, event.Message)
+		if event.Repository != "" {
+			details = append(details, "Repository="+event.Repository)
+		}
+		if event.Reference != "" {
+			details = append(details, "Reference="+event.Reference)
+		}
+		if event.Digest != "" {
+			details = append(details, "Digest="+event.Digest)
+		}
+		context := ""
+		if len(details) > 0 {
+			context = " " + strings.Join(details, " ")
+		}
+		fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, context, event.Message)
 	}
 	return 0
 }
