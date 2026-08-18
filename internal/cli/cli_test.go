@@ -48,6 +48,27 @@ func TestRunOnboardGuidesUserAndCreatesConfiguration(t *testing.T) {
 	}
 }
 
+func TestRunOnboardCanWriteExplicitPlaintextProviderPassword(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	input := strings.NewReader("\n\n\ny\nmirror\nhttps://mirror.example.test\nn\ny\nrobot\npassword\nplain-pat\nn\nn\n")
+	var output, errors bytes.Buffer
+	exitCode := cli.Run(context.Background(), []string{"onboard", "--no-start", "--skip-trust-install", "--config", configPath}, input, &output, &errors)
+	if exitCode != 0 {
+		t.Fatalf("cli.Run() exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated configuration: %v", err)
+	}
+	for _, expected := range []string{"name: mirror", "username: robot", "password: plain-pat"} {
+		if !strings.Contains(string(contents), expected) {
+			t.Errorf("generated configuration lacks %q:\n%s", expected, contents)
+		}
+	}
+}
+
 func TestRunReturnsUsageErrorForUnknownCommand(t *testing.T) {
 	t.Parallel()
 

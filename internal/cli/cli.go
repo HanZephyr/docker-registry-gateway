@@ -1976,11 +1976,26 @@ func promptAdditionalProviders(reader *bufio.Reader, output io.Writer) ([]config
 		}
 		provider := config.Provider{Name: name, URL: endpoint, Resolver: resolver, PullProvider: pullProvider}
 		if strings.TrimSpace(username) != "" {
-			secretFile, promptErr := prompt(reader, output, "上游 secret_file 路径（单行密码或 PAT）", "")
-			if promptErr != nil || strings.TrimSpace(secretFile) == "" {
-				return nil, errors.New("配置用户名时 secret_file 不能为空")
+			credentialMode, promptErr := prompt(reader, output, "上游凭据保存方式（secret_file/password）", "secret_file")
+			if promptErr != nil {
+				return nil, promptErr
 			}
-			provider.Auth = config.Auth{Username: username, SecretFile: secretFile}
+			switch strings.ToLower(strings.TrimSpace(credentialMode)) {
+			case "secret_file":
+				secretFile, secretErr := prompt(reader, output, "上游 secret_file 路径（单行密码或 PAT）", "")
+				if secretErr != nil || strings.TrimSpace(secretFile) == "" {
+					return nil, errors.New("配置用户名时 secret_file 不能为空")
+				}
+				provider.Auth = config.Auth{Username: username, SecretFile: secretFile}
+			case "password":
+				password, passwordErr := prompt(reader, output, "上游密码或 PAT（将明文写入配置，不推荐）", "")
+				if passwordErr != nil || strings.TrimSpace(password) == "" {
+					return nil, errors.New("配置用户名时 password 不能为空")
+				}
+				provider.Auth = config.Auth{Username: username, Password: password}
+			default:
+				return nil, fmt.Errorf("上游凭据保存方式只能是 secret_file 或 password，得到 %q", credentialMode)
+			}
 		}
 		providers = append(providers, provider)
 		more, promptErr := promptYesNo(reader, output, "继续添加 Provider", false)
