@@ -233,39 +233,62 @@ func (value *Config) applyDefaults() {
 }
 
 func (retention *Retention) applyDefaults() {
+	defaults := DefaultRetention()
 	if retention.EventRetention == "" {
-		retention.EventRetention = "168h"
+		retention.EventRetention = defaults.EventRetention
 	}
 	if retention.EventMaxBytes == "" {
-		retention.EventMaxBytes = "100MiB"
+		retention.EventMaxBytes = defaults.EventMaxBytes
 	}
 	if retention.HealthRetention == "" {
-		retention.HealthRetention = "168h"
+		retention.HealthRetention = defaults.HealthRetention
 	}
 }
 
 func (resources *Resources) applyDefaults() {
+	defaults := DefaultResources()
 	if resources.MaxConcurrentPulls == 0 {
-		resources.MaxConcurrentPulls = 4
+		resources.MaxConcurrentPulls = defaults.MaxConcurrentPulls
 	}
 	if resources.MaxSegmentsPerBlob == 0 {
-		resources.MaxSegmentsPerBlob = 4
+		resources.MaxSegmentsPerBlob = defaults.MaxSegmentsPerBlob
 	}
 	if resources.TemporaryDiskQuota == "" {
-		resources.TemporaryDiskQuota = "2GiB"
+		resources.TemporaryDiskQuota = defaults.TemporaryDiskQuota
 	}
 	if resources.MinSegmentSize == "" {
-		resources.MinSegmentSize = "16MiB"
+		resources.MinSegmentSize = defaults.MinSegmentSize
 	}
 	if resources.MaxNoRangeRestartDiscard == "" {
-		resources.MaxNoRangeRestartDiscard = "64MiB"
+		resources.MaxNoRangeRestartDiscard = defaults.MaxNoRangeRestartDiscard
 	}
 	if resources.MaxInflightRequests == 0 {
-		resources.MaxInflightRequests = 32
+		resources.MaxInflightRequests = defaults.MaxInflightRequests
 	}
 	if resources.MaxQueuedPulls == 0 {
-		resources.MaxQueuedPulls = 16
+		resources.MaxQueuedPulls = defaults.MaxQueuedPulls
 	}
+}
+
+// DefaultResources is the single source of conservative V1 resource limits.
+// Onboarding renders these values explicitly so a generated config remains
+// understandable even if a later release changes its defaults.
+func DefaultResources() Resources {
+	return Resources{
+		MaxConcurrentPulls:       4,
+		MaxSegmentsPerBlob:       4,
+		TemporaryDiskQuota:       "2GiB",
+		MinSegmentSize:           "16MiB",
+		MaxNoRangeRestartDiscard: "64MiB",
+		MaxInflightRequests:      32,
+		MaxQueuedPulls:           16,
+	}
+}
+
+// DefaultRetention is the single source of V1 file-backed diagnostic
+// retention defaults.
+func DefaultRetention() Retention {
+	return Retention{EventRetention: "168h", EventMaxBytes: "100MiB", HealthRetention: "168h"}
 }
 
 // LoadFile loads a configuration file and resolves every documented relative

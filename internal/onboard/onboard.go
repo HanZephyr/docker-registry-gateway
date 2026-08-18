@@ -195,34 +195,36 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string, answers 
 	builder.WriteString("  max_no_range_restart_discard: " + yamlScalar(resources.MaxNoRangeRestartDiscard) + "\n")
 	builder.WriteString(fmt.Sprintf("  max_inflight_requests: %d\n", resources.MaxInflightRequests))
 	builder.WriteString(fmt.Sprintf("  max_queued_pulls: %d\n", resources.MaxQueuedPulls))
+	retention := config.DefaultRetention()
 	builder.WriteString("\nretention:\n")
-	builder.WriteString("  event_retention: 168h\n")
-	builder.WriteString("  event_max_bytes: 100MiB\n")
-	builder.WriteString("  health_retention: 168h\n")
+	builder.WriteString("  event_retention: " + yamlScalar(retention.EventRetention) + "\n")
+	builder.WriteString("  event_max_bytes: " + yamlScalar(retention.EventMaxBytes) + "\n")
+	builder.WriteString("  health_retention: " + yamlScalar(retention.HealthRetention) + "\n")
 	return builder.String(), nil
 }
 
 func normalizedResources(resources config.Resources) config.Resources {
+	defaults := config.DefaultResources()
 	if resources.MaxConcurrentPulls == 0 {
-		resources.MaxConcurrentPulls = 4
+		resources.MaxConcurrentPulls = defaults.MaxConcurrentPulls
 	}
 	if resources.MaxSegmentsPerBlob == 0 {
-		resources.MaxSegmentsPerBlob = 4
+		resources.MaxSegmentsPerBlob = defaults.MaxSegmentsPerBlob
 	}
 	if resources.TemporaryDiskQuota == "" {
-		resources.TemporaryDiskQuota = "2GiB"
+		resources.TemporaryDiskQuota = defaults.TemporaryDiskQuota
 	}
 	if resources.MinSegmentSize == "" {
-		resources.MinSegmentSize = "16MiB"
+		resources.MinSegmentSize = defaults.MinSegmentSize
 	}
 	if resources.MaxNoRangeRestartDiscard == "" {
-		resources.MaxNoRangeRestartDiscard = "64MiB"
+		resources.MaxNoRangeRestartDiscard = defaults.MaxNoRangeRestartDiscard
 	}
 	if resources.MaxInflightRequests == 0 {
-		resources.MaxInflightRequests = 32
+		resources.MaxInflightRequests = defaults.MaxInflightRequests
 	}
 	if resources.MaxQueuedPulls == 0 {
-		resources.MaxQueuedPulls = 16
+		resources.MaxQueuedPulls = defaults.MaxQueuedPulls
 	}
 	return resources
 }

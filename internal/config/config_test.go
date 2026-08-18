@@ -53,6 +53,17 @@ allow_non_range_providers: true
 	}
 }
 
+func TestDefaultConfigurationValuesAreStableForOnboarding(t *testing.T) {
+	t.Parallel()
+
+	if got, want := config.DefaultResources().TemporaryDiskQuota, "2GiB"; got != want {
+		t.Errorf("DefaultResources().TemporaryDiskQuota = %q, want %q", got, want)
+	}
+	if got, want := config.DefaultRetention().HealthRetention, "168h"; got != want {
+		t.Errorf("DefaultRetention().HealthRetention = %q, want %q", got, want)
+	}
+}
+
 func TestLoadFileResolvesProviderSecretFileAndValidatesPriority(t *testing.T) {
 	t.Parallel()
 
