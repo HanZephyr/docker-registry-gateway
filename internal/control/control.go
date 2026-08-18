@@ -27,6 +27,7 @@ type Status struct {
 	PID         int              `json:"pid"`
 	Listeners   []string         `json:"listeners,omitempty"`
 	ActivePulls int              `json:"active_pulls"`
+	QueuedPulls int              `json:"queued_pulls"`
 	Providers   []ProviderHealth `json:"providers,omitempty"`
 }
 

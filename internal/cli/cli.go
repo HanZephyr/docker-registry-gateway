@@ -181,9 +181,12 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
 	}
-	backend := gateway.New(runtimeRouter)
+	backend := gateway.New(runtimeRouter, gateway.Options{
+		MaxConcurrentPulls: loaded.Resources.MaxConcurrentPulls,
+		MaxQueuedPulls:     loaded.Resources.MaxQueuedPulls,
+	})
 	server := &http.Server{
-		Handler:   registry.NewHandler(backend),
+		Handler:   gateway.LimitRequests(registry.NewHandler(backend), loaded.Resources.MaxInflightRequests),
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12},
 	}
 
@@ -258,6 +261,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 				State:       "running",
 				Listeners:   append([]string(nil), listenersForStatus...),
 				ActivePulls: backend.ActivePulls(),
+				QueuedPulls: backend.QueuedPulls(),
 				Providers:   providerHealthStatuses(tracker.Snapshot()),
 			}
 		},
@@ -268,8 +272,8 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			if err != nil {
 				return fmt.Errorf("读取或校验新配置: %w", err)
 			}
-			if !sameServeConfiguration(currentConfig, candidate) {
-				return errors.New("监听地址、访问地址、TLS 模式或 data_dir 已改变，需要使用 drg restart")
+			if !sameServeConfiguration(currentConfig, candidate) || admissionConfigurationChanged(currentConfig, candidate) {
+				return errors.New("监听地址、访问地址、TLS 模式、data_dir 或请求并发上限已改变，需要使用 drg restart")
 			}
 			if resolverConfigurationChanged(currentConfig, candidate) {
 				store, storeErr := lease.Open(filepath.Join(currentConfig.DataDir, "decision-leases.json"), time.Now())
@@ -491,6 +495,12 @@ func sameServeConfiguration(current, candidate config.Config) bool {
 	return true
 }
 
+func admissionConfigurationChanged(current, candidate config.Config) bool {
+	return current.Resources.MaxConcurrentPulls != candidate.Resources.MaxConcurrentPulls ||
+		current.Resources.MaxInflightRequests != candidate.Resources.MaxInflightRequests ||
+		current.Resources.MaxQueuedPulls != candidate.Resources.MaxQueuedPulls
+}
+
 func runStatus(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	loaded, exitCode := loadControlConfiguration("status", arguments, errorOutput)
 	if exitCode != 0 {
@@ -501,7 +511,7 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 		fmt.Fprintf(errorOutput, "读取运行状态失败: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, strings.Join(status.Listeners, ", "))
+	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；排队拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, status.QueuedPulls, strings.Join(status.Listeners, ", "))
 	for _, provider := range status.Providers {
 		fmt.Fprintf(output, "Provider %s：近期吞吐 %.2f MiB/s；本进程失败 %d；最近成功 %s；最近失败 %s\n",
 			provider.Name,

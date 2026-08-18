@@ -26,3 +26,16 @@ func TestResolverConfigurationChangedPreservesLeasesForPullOnlyChanges(t *testin
 		t.Fatal("tie breaker change should invalidate existing leases")
 	}
 }
+
+func TestAdmissionConfigurationChangedRequiresRestart(t *testing.T) {
+	t.Parallel()
+	current := config.Config{Resources: config.Resources{MaxConcurrentPulls: 4, MaxInflightRequests: 32, MaxQueuedPulls: 16}}
+	candidate := current
+	if admissionConfigurationChanged(current, candidate) {
+		t.Fatal("identical admission limits must not require a restart")
+	}
+	candidate.Resources.MaxQueuedPulls = 17
+	if !admissionConfigurationChanged(current, candidate) {
+		t.Fatal("changed queue capacity must require a restart")
+	}
+}
