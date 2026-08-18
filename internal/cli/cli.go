@@ -399,6 +399,8 @@ func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bo
 	return result, nil
 }
 
+const providerProbeInterval = 15 * time.Minute
+
 func runServe(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
@@ -515,6 +517,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		listeners = append(listeners, listener)
 	}
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
+	var reloadMu sync.Mutex
 	currentConfig := loaded
 	probeContext, stopProbing := context.WithCancel(ctx)
 	_ = events.Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway 已启动"})
@@ -567,7 +570,12 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		probeMu.Unlock()
 		probeGroup.Wait()
 	}()
-	var reloadMu sync.Mutex
+	stopPeriodicProbes := startPeriodicProviderProbes(probeContext, providerProbeInterval, func() config.Config {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		return currentConfig
+	}, launchProbe)
+	defer stopPeriodicProbes()
 	localControl, err := control.Start(loaded.DataDir, control.Callbacks{
 		Status: func() control.Status {
 			return control.Status{
@@ -694,7 +702,51 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 		if parent.Err() != nil {
 			return
 		}
-		fmt.Fprintf(output, "Provider %s 初始准入探测失败：%v；服务将继续运行并在后续拉取中恢复。\n", configured.Name, err)
+		tracker.RecordProviderFailure(configured.Name, err)
+		_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_probe_failed", Provider: configured.Name, Message: "provider admission probe failed"})
+		fmt.Fprintf(output, "Provider %s 主动探测失败：%v；服务将继续运行，并在下一次主动探测或后续拉取中恢复。\n", configured.Name, err)
+	}
+}
+
+// startPeriodicProviderProbes runs low-frequency, bounded admission probes so
+// an idle or previously unavailable Provider can recover without waiting for a
+// user pull. The current configuration is fetched on every tick, which keeps
+// successful hot reloads visible without mutating in-flight transfers.
+func startPeriodicProviderProbes(parent context.Context, interval time.Duration, current func() config.Config, launch func(config.Config)) func() {
+	if interval <= 0 || current == nil || launch == nil {
+		return func() {}
+	}
+	stopping := make(chan struct{})
+	var once sync.Once
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-parent.Done():
+				return
+			case <-stopping:
+				return
+			case <-ticker.C:
+				select {
+				case <-parent.Done():
+					return
+				case <-stopping:
+					return
+				default:
+				}
+				launch(current())
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(stopping)
+			group.Wait()
+		})
 	}
 }
 

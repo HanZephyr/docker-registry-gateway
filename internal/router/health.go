@@ -138,6 +138,23 @@ func (health *Health) RecordIntegrityViolation(provider string) {
 	health.recordUnavailable(provider, func(state *healthState) { state.integrityInvalid = true })
 }
 
+// RecordProviderFailure maps a typed upstream failure to its selection
+// consequence. It is shared by real transfers and active admission probes so
+// an idle Provider cannot remain falsely eligible after a known auth, content
+// integrity, or rate-limit failure.
+func (health *Health) RecordProviderFailure(provider string, err error) {
+	switch {
+	case registry.IsFailureKind(err, registry.FailureRateLimited):
+		health.RecordRateLimited(provider, registry.RetryAfter(err))
+	case registry.IsFailureKind(err, registry.FailureAuthentication):
+		health.RecordAuthenticationFailure(provider)
+	case registry.IsFailureKind(err, registry.FailureIntegrity):
+		health.RecordIntegrityViolation(provider)
+	default:
+		health.RecordFailure(provider)
+	}
+}
+
 // RecordProbeSuccess restores a Provider after a fresh V2/manifest/blob
 // admission probe without discarding its historical throughput observation.
 func (health *Health) RecordProbeSuccess(provider string) {

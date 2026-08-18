@@ -47,6 +47,29 @@ func TestHealthProbeSuccessRestoresAuthenticationAndIntegrityStates(t *testing.T
 	}
 }
 
+func TestHealthRecordsTypedProviderFailures(t *testing.T) {
+	t.Parallel()
+
+	health := router.NewHealth()
+	health.RecordProviderFailure("rate", registry.NewFailure(registry.FailureRateLimited, time.Minute, nil))
+	health.RecordProviderFailure("auth", registry.NewFailure(registry.FailureAuthentication, 0, nil))
+	health.RecordProviderFailure("integrity", registry.NewFailure(registry.FailureIntegrity, 0, nil))
+
+	states := map[string]router.HealthSnapshot{}
+	for _, snapshot := range health.Snapshot() {
+		states[snapshot.Provider] = snapshot
+	}
+	if states["rate"].RateLimitedUntil.Before(time.Now()) {
+		t.Errorf("rate snapshot = %#v, want active cooldown", states["rate"])
+	}
+	if !states["auth"].AuthenticationInvalid {
+		t.Errorf("auth snapshot = %#v, want authentication exclusion", states["auth"])
+	}
+	if !states["integrity"].IntegrityInvalid {
+		t.Errorf("integrity snapshot = %#v, want integrity exclusion", states["integrity"])
+	}
+}
+
 func TestHealthPrefersProviderWithLowerRecentFirstByteLatency(t *testing.T) {
 	t.Parallel()
 

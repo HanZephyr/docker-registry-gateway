@@ -594,16 +594,16 @@ func (router *Router) recordSourceFailure(provider string, err error) {
 	}
 	switch {
 	case registry.IsFailureKind(err, registry.FailureRateLimited):
-		router.health.RecordRateLimited(provider, registry.RetryAfter(err))
+		router.health.RecordProviderFailure(provider, err)
 		router.emit(Event{Level: "warning", Code: "provider_rate_limited", Provider: provider, Message: "provider entered its upstream rate-limit cooldown"})
 	case registry.IsFailureKind(err, registry.FailureAuthentication):
-		router.health.RecordAuthenticationFailure(provider)
+		router.health.RecordProviderFailure(provider, err)
 		router.emit(Event{Level: "error", Code: "provider_authentication_invalid", Provider: provider, Message: "provider authentication failed after one token refresh"})
 	case registry.IsFailureKind(err, registry.FailureIntegrity):
-		router.health.RecordIntegrityViolation(provider)
+		router.health.RecordProviderFailure(provider, err)
 		router.emit(Event{Level: "error", Code: "provider_integrity_isolated", Provider: provider, Message: "provider content or metadata disagreed with the selected digest and was isolated"})
 	default:
-		router.health.RecordFailure(provider)
+		router.health.RecordProviderFailure(provider, err)
 		router.emit(Event{Level: "warning", Code: "provider_unavailable", Provider: provider, Message: "provider request failed temporarily"})
 	}
 }
