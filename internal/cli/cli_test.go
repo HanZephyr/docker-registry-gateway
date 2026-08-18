@@ -137,6 +137,43 @@ allow_non_range_providers: true
 	}
 }
 
+func TestRunDoctorPerformsReadOnlyLocalDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	configDirectory := t.TempDir()
+	configPath := filepath.Join(configDirectory, "drg.yaml")
+	contents := `
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: true
+    install_trust: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	var setupOutput, setupErrors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"tls", "reconcile", "--config", configPath}, strings.NewReader(""), &setupOutput, &setupErrors); exitCode != 0 {
+		t.Fatalf("tls reconcile exit code = %d, stderr = %s", exitCode, setupErrors.String())
+	}
+	var output, errors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"doctor", "--skip-providers", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("doctor exit code = %d, stderr = %s, stdout = %s", exitCode, errors.String(), output.String())
+	}
+	for _, expected := range []string{"配置：正常", "TLS：正常", "Docker 镜像源和根证书信任属于部署边界"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("doctor output lacks %q:\n%s", expected, output.String())
+		}
+	}
+}
+
 func TestRunLocalControlCommands(t *testing.T) {
 	t.Parallel()
 

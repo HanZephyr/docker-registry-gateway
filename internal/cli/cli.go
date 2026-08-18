@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,6 +46,8 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runOnboard(ctx, arguments[1:], input, output, errorOutput)
 	case "config":
 		return runConfig(arguments[1:], output, errorOutput)
+	case "doctor":
+		return runDoctor(ctx, arguments[1:], output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
 	case "start":
@@ -831,6 +835,101 @@ func runConfig(arguments []string, output, errorOutput io.Writer) int {
 	return 0
 }
 
+func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	skipProviders := flags.Bool("skip-providers", false, "跳过 Provider 联网探测")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(errorOutput, "doctor 不接受位置参数")
+		}
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "配置检查失败: %v\n", err)
+		return 1
+	}
+	absPath, _ := filepath.Abs(*configPath)
+	fmt.Fprintf(output, "配置：正常（%s）\n", absPath)
+	printSecurityWarnings(output, loaded)
+	failed := false
+	for _, listener := range loaded.Server.Listeners {
+		if _, err := net.ResolveTCPAddr("tcp", listener); err != nil {
+			fmt.Fprintf(output, "监听地址 %s：异常（%v）\n", listener, err)
+			failed = true
+		} else {
+			fmt.Fprintf(output, "监听地址 %s：可解析\n", listener)
+		}
+	}
+	if err := diagnoseTLS(loaded, output); err != nil {
+		fmt.Fprintf(output, "TLS：异常（%v）；可执行 drg tls reconcile 处理\n", err)
+		failed = true
+	}
+	if !*skipProviders {
+		for _, configured := range loaded.Providers {
+			probeContext, cancel := context.WithTimeout(ctx, 15*time.Second)
+			username, password, credentialErr := configured.Auth.Credentials()
+			client, createErr := provider.New(provider.Options{URL: configured.URL, Username: username, Password: password, CAFile: configured.CAFile})
+			if credentialErr == nil && createErr == nil {
+				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
+				cancel()
+				if probeErr == nil {
+					fmt.Fprintf(output, "Provider %s：正常（Range=%t，manifest=%s）\n", configured.Name, result.RangeSupported, result.ManifestDigest)
+					continue
+				}
+				fmt.Fprintf(output, "Provider %s：异常（%v）\n", configured.Name, probeErr)
+			} else {
+				cancel()
+				if credentialErr != nil {
+					fmt.Fprintf(output, "Provider %s：异常（%v）\n", configured.Name, credentialErr)
+				} else {
+					fmt.Fprintf(output, "Provider %s：异常（%v）\n", configured.Name, createErr)
+				}
+			}
+			failed = true
+		}
+	}
+	fmt.Fprintln(output, "Docker 镜像源和根证书信任属于部署边界，doctor 不读取或修改 Docker 配置。")
+	if failed {
+		return 1
+	}
+	return 0
+}
+
+func diagnoseTLS(loaded config.Config, output io.Writer) error {
+	if !loaded.Server.TLS.LocalCA {
+		return errors.New("local_ca 已关闭，首版服务不支持")
+	}
+	certificatePath := filepath.Join(loaded.DataDir, "pki", "server.crt")
+	keyPath := filepath.Join(loaded.DataDir, "pki", "server.key")
+	caPath := filepath.Join(loaded.DataDir, "pki", "ca.crt")
+	if _, err := tls.LoadX509KeyPair(certificatePath, keyPath); err != nil {
+		return err
+	}
+	contents, err := os.ReadFile(certificatePath)
+	if err != nil {
+		return err
+	}
+	block, _ := pem.Decode(contents)
+	if block == nil {
+		return errors.New("server.crt 不是 PEM 证书")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return err
+	}
+	if time.Until(certificate.NotAfter) <= 0 {
+		return errors.New("服务端证书已过期")
+	}
+	if _, err := os.Stat(caPath); err != nil {
+		return err
+	}
+	fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；CA=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), caPath)
+	return nil
+}
+
 func printSecurityWarnings(output io.Writer, loaded config.Config) {
 	for _, warning := range loaded.SecurityWarnings() {
 		fmt.Fprintf(output, "[高优先级安全警告] %s\n", warning.Message)
@@ -1042,6 +1141,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "\n命令：")
 	fmt.Fprintln(output, "  onboard  交互式生成首次部署配置")
 	fmt.Fprintln(output, "  config validate  严格校验主配置")
+	fmt.Fprintln(output, "  doctor  只读诊断配置、TLS、监听和 Provider")
 	fmt.Fprintln(output, "  tls reconcile  对账本地 CA 与服务端证书")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
 	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
