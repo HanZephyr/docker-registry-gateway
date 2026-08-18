@@ -67,3 +67,7 @@ go test ./...
 ```
 
 脚本会产出 Windows、Linux、macOS 的 amd64 与 arm64 原生二进制到 `dist/`。发布前还应在目标平台执行 `drg doctor`，并用真实 Docker daemon 完成 `docker pull` 验收。
+
+## 无公网 Docker E2E fixture
+
+[`scripts/docker-e2e-fixture.ps1`](scripts/docker-e2e-fixture.ps1) 提供一个只含 OCI config 的本地镜像源，配合 [`testdata/docker-e2e-local.yaml`](testdata/docker-e2e-local.yaml) 可在无法访问 Docker Hub 的环境中验收完整成功链路：Docker Client → DRG → Provider。该 fixture 仅用于测试，默认监听 `56999`，不属于 Gateway 运行时组件。

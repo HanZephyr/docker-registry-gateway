@@ -1,0 +1,16 @@
+version: 1
+data_dir: /tmp/drg
+server:
+  listeners: [0.0.0.0:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: local_fixture
+    url: http://host.docker.internal:56999
+    allow_insecure_http: true
+    resolver: true
+    pull_provider: true
+probe_ref: library/empty:latest
+resources:
+  max_segments_per_blob: 1
