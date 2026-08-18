@@ -100,6 +100,36 @@ allow_non_range_providers: true
 	}
 }
 
+func TestRunConfigMigrateLeavesCurrentV1ConfigurationUntouched(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	contents := []byte(`version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`)
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var output, errors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"config", "migrate", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("config migrate exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	if current, err := os.ReadFile(configPath); err != nil || string(current) != string(contents) {
+		t.Errorf("current configuration changed by no-op migration: %v", err)
+	}
+	if !strings.Contains(output.String(), "无需改写") {
+		t.Errorf("migrate output = %q", output.String())
+	}
+}
+
 func TestRunTLSReconcileCreatesLocalCertificateMaterial(t *testing.T) {
 	t.Parallel()
 

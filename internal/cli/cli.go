@@ -1422,14 +1422,26 @@ func loadControlConfigurationWithPath(command string, arguments []string, errorO
 }
 
 func runConfig(arguments []string, output, errorOutput io.Writer) int {
-	if len(arguments) == 0 || arguments[0] != "validate" {
-		fmt.Fprintln(errorOutput, "用法：drg config validate --config <路径>")
+	if len(arguments) == 0 {
+		fmt.Fprintln(errorOutput, "用法：drg config <validate|migrate> --config <路径>")
 		return 2
 	}
+	switch arguments[0] {
+	case "validate":
+		return runConfigValidate(arguments[1:], output, errorOutput)
+	case "migrate":
+		return runConfigMigrate(arguments[1:], output, errorOutput)
+	default:
+		fmt.Fprintln(errorOutput, "用法：drg config <validate|migrate> --config <路径>")
+		return 2
+	}
+}
+
+func runConfigValidate(arguments []string, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("config validate", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
 	if flags.NArg() != 0 {
@@ -1447,6 +1459,33 @@ func runConfig(arguments []string, output, errorOutput io.Writer) int {
 	}
 	fmt.Fprintf(output, "配置有效：%s\n", absPath)
 	printSecurityWarnings(output, loaded)
+	return 0
+}
+
+func runConfigMigrate(arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("config migrate", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(errorOutput, "config migrate 不接受位置参数")
+		}
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return 1
+	}
+	if loaded.Version != 1 {
+		fmt.Fprintf(errorOutput, "不支持从配置版本 %d 迁移\n", loaded.Version)
+		return 1
+	}
+	absPath, err := filepath.Abs(*configPath)
+	if err != nil {
+		absPath = *configPath
+	}
+	fmt.Fprintf(output, "配置已是当前 V1 格式，无需改写：%s\n", absPath)
 	return 0
 }
 
