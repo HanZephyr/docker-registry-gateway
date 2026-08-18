@@ -176,10 +176,10 @@ providers:
 		t.Fatalf("tls reconcile exit code = %d, stderr = %s", exitCode, setupErrors.String())
 	}
 	var output, errors bytes.Buffer
-	if exitCode := cli.Run(context.Background(), []string{"doctor", "--skip-providers", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+	if exitCode := cli.Run(context.Background(), []string{"doctor", "--skip-providers", "--skip-docker", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("doctor exit code = %d, stderr = %s, stdout = %s", exitCode, errors.String(), output.String())
 	}
-	for _, expected := range []string{"配置：正常", "TLS：正常", "Docker 镜像源和根证书信任属于部署边界"} {
+	for _, expected := range []string{"配置：正常", "TLS：正常", "Docker daemon：已按参数跳过检查", "Docker 镜像源配置与根证书信任属于部署边界"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Errorf("doctor output lacks %q:\n%s", expected, output.String())
 		}

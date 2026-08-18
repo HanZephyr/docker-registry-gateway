@@ -1419,6 +1419,7 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	skipProviders := flags.Bool("skip-providers", false, "跳过 Provider 联网探测")
+	skipDocker := flags.Bool("skip-docker", false, "跳过本机 Docker daemon 只读检查")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
 		if err == nil {
 			fmt.Fprintln(errorOutput, "doctor 不接受位置参数")
@@ -1470,7 +1471,20 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 			failed = true
 		}
 	}
-	fmt.Fprintln(output, "Docker 镜像源和根证书信任属于部署边界，doctor 不读取或修改 Docker 配置。")
+	if *skipDocker {
+		fmt.Fprintln(output, "Docker daemon：已按参数跳过检查。")
+	} else {
+		dockerContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+		version, dockerErr := exec.CommandContext(dockerContext, "docker", "version", "--format", "{{.Server.Version}}").Output()
+		cancel()
+		if dockerErr != nil {
+			fmt.Fprintf(output, "Docker daemon：异常（%v）\n", dockerErr)
+			failed = true
+		} else {
+			fmt.Fprintf(output, "Docker daemon：可达（Server %s）\n", strings.TrimSpace(string(version)))
+		}
+	}
+	fmt.Fprintln(output, "Docker 镜像源配置与根证书信任属于部署边界，doctor 不读取或修改 Docker 配置。")
 	if failed {
 		return 1
 	}
@@ -1508,12 +1522,39 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	if time.Until(certificate.NotAfter) <= 0 {
 		return errors.New("服务端证书已过期")
 	}
+	host, _, err := net.SplitHostPort(loaded.Server.TLS.AdvertiseEndpoint)
+	if err != nil {
+		return err
+	}
 	if caPath != "" {
-		if _, err := os.Stat(caPath); err != nil {
+		contents, err := os.ReadFile(caPath)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；本地 CA=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), caPath)
+		block, _ := pem.Decode(contents)
+		if block == nil {
+			return errors.New("本地 CA 不是 PEM 证书")
+		}
+		root, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return err
+		}
+		if !root.IsCA || time.Until(root.NotAfter) <= 0 {
+			return errors.New("本地 CA 无效或已过期")
+		}
+		roots := x509.NewCertPool()
+		roots.AddCert(root)
+		if _, err := certificate.Verify(x509.VerifyOptions{Roots: roots, DNSName: host, CurrentTime: time.Now()}); err != nil {
+			return fmt.Errorf("服务端证书未通过本地 CA 或访问地址校验: %w", err)
+		}
+		if time.Until(root.NotAfter) <= 90*24*time.Hour {
+			return fmt.Errorf("本地 CA 将在 %s 到期；请执行 drg tls rotate-root", root.NotAfter.Local().Format(time.RFC3339))
+		}
+		fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；本地 CA 到期时间 %s；链路与访问地址已校验）\n", certificate.NotAfter.Local().Format(time.RFC3339), root.NotAfter.Local().Format(time.RFC3339))
 	} else {
+		if err := certificate.VerifyHostname(host); err != nil {
+			return fmt.Errorf("外部证书不匹配 advertise_endpoint: %w", err)
+		}
 		fmt.Fprintf(output, "TLS：正常（外部叶证书到期时间 %s；cert=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), certificatePath)
 	}
 	return nil
