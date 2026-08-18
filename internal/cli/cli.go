@@ -23,6 +23,7 @@ import (
 
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
+	"github.com/hjx/docker-registry-gateway/internal/eventlog"
 	"github.com/hjx/docker-registry-gateway/internal/gateway"
 	"github.com/hjx/docker-registry-gateway/internal/healthhistory"
 	"github.com/hjx/docker-registry-gateway/internal/lease"
@@ -48,6 +49,8 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runConfig(arguments[1:], output, errorOutput)
 	case "doctor":
 		return runDoctor(ctx, arguments[1:], output, errorOutput)
+	case "events":
+		return runEvents(arguments[1:], output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
 	case "start":
@@ -217,6 +220,8 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
 	currentConfig := loaded
 	probeContext, stopProbing := context.WithCancel(ctx)
+	events := eventlog.New(loaded.DataDir, time.Now)
+	_ = events.Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway 已启动"})
 	var probeMu sync.Mutex
 	var probeGroup sync.WaitGroup
 	probesStopping := false
@@ -256,7 +261,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		probeGroup.Add(1)
 		go func() {
 			defer probeGroup.Done()
-			probeProviders(probeContext, configuration, probeOutput)
+			probeProviders(probeContext, configuration, probeOutput, events)
 		}()
 	}
 	defer func() {
@@ -355,7 +360,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	}
 }
 
-func probeProviders(parent context.Context, loaded config.Config, output io.Writer) {
+func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log) {
 	for _, configured := range loaded.Providers {
 		if parent.Err() != nil {
 			return
@@ -373,6 +378,7 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 			if err == nil {
 				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
 				if probeErr == nil {
+					_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: fmt.Sprintf("Range=%t", result.RangeSupported)})
 					if result.RangeSupported {
 						fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", configured.Name)
 					} else if loaded.AllowNonRangeProviders {
@@ -928,6 +934,41 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	}
 	fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；CA=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), caPath)
 	return nil
+}
+
+func runEvents(arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("events", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	limit := flags.Int("limit", 50, "最多显示的事件数量")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || *limit < 1 {
+		if err == nil {
+			fmt.Fprintln(errorOutput, "events 不接受位置参数，且 limit 必须大于零")
+		}
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return 1
+	}
+	events, err := eventlog.New(loaded.DataDir, time.Now).Read(*limit)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取事件日志失败: %v\n", err)
+		return 1
+	}
+	if len(events) == 0 {
+		fmt.Fprintln(output, "暂无事件。")
+		return 0
+	}
+	for _, event := range events {
+		provider := ""
+		if event.Provider != "" {
+			provider = " Provider=" + event.Provider
+		}
+		fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, provider, event.Message)
+	}
+	return 0
 }
 
 func printSecurityWarnings(output io.Writer, loaded config.Config) {
