@@ -34,6 +34,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 	"github.com/hjx/docker-registry-gateway/internal/router"
+	"github.com/hjx/docker-registry-gateway/internal/tempstate"
 	"github.com/hjx/docker-registry-gateway/internal/trust"
 	"gopkg.in/yaml.v3"
 )
@@ -468,6 +469,16 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		return 1
 	}
 	tempBudget := router.NewTempBudget(temporaryDiskQuota)
+	temporaryWorkspace, err := tempstate.Prepare(loaded.Resources.TempDir, loaded.DataDir)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "初始化分片临时目录失败: %v\n", err)
+		return 1
+	}
+	defer func() {
+		if cleanupErr := temporaryWorkspace.Close(); cleanupErr != nil {
+			fmt.Fprintf(errorOutput, "清理分片临时目录失败（下次启动将安全重试）: %v\n", cleanupErr)
+		}
+	}()
 	events := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	eventObserver := router.ObserverFunc(func(event router.Event) {
 		_ = events.Write(eventlog.Event{
@@ -480,7 +491,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			Message:    event.Message,
 		})
 	})
-	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, routeGuard, eventObserver)
+	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
@@ -604,7 +615,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, routeGuard, eventObserver)
+			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
 			if err != nil {
 				return err
 			}
@@ -761,7 +772,7 @@ func (writer *lockedWriter) Write(contents []byte) (int, error) {
 	return writer.writer.Write(contents)
 }
 
-func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget, routeGuard routeguard.Guard, observer router.Observer) (*router.Router, error) {
+func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget, temporaryDir string, routeGuard routeguard.Guard, observer router.Observer) (*router.Router, error) {
 	sources := make([]router.Source, 0, len(loaded.Providers))
 	for _, configured := range loaded.Providers {
 		username, password, err := configured.Auth.Credentials()
@@ -816,7 +827,7 @@ func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, temp
 		Health:                   tracker,
 		MaxSegmentsPerBlob:       loaded.Resources.MaxSegmentsPerBlob,
 		MinSegmentSize:           minSegmentSize,
-		TemporaryDir:             loaded.Resources.TempDir,
+		TemporaryDir:             temporaryDir,
 		TempBudget:               tempBudget,
 		Observer:                 observer,
 	}), nil

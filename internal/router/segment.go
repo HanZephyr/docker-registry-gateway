@@ -48,7 +48,7 @@ func (budget *TempBudget) acquire(bytes int64) (func(), bool) {
 }
 
 func (router *Router) trySegmentedBlob(ctx context.Context, repository, digest string) (registry.Blob, bool) {
-	if router.maxSegmentsPerBlob < 2 || router.minSegmentSize <= 0 || router.tempBudget == nil {
+	if router.maxSegmentsPerBlob < 2 || router.minSegmentSize <= 0 || router.tempBudget == nil || router.temporaryDir == "" {
 		return registry.Blob{}, false
 	}
 	metadata, err := router.openBlob(ctx, repository, digest, "bytes=0-0")
@@ -123,9 +123,6 @@ func segmentStorageBytes(segments []segment) int64 {
 
 func (router *Router) startSegmentDownloads(parent context.Context, repository, digest string, size int64, segments []segment, release func()) (*segmentedReader, error) {
 	directory := router.temporaryDir
-	if directory == "" {
-		directory = os.TempDir()
-	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, err
 	}
