@@ -129,7 +129,22 @@ func (router *Router) startSegmentDownloads(parent context.Context, repository, 
 	downloadContext, cancel := context.WithCancel(parent)
 	ready := make([]chan error, len(segments))
 	done := make(chan struct{})
-	reader := &segmentedReader{segments: segments, ready: ready, done: done, cancel: cancel, release: release}
+	reader := &segmentedReader{
+		ctx:      parent,
+		segments: segments,
+		ready:    ready,
+		done:     done,
+		cancel:   cancel,
+		release:  release,
+		digest:   digest,
+		size:     size,
+		fallbackOpen: func(offset int64) (registry.Blob, error) {
+			return router.openBlob(parent, repository, digest, fmt.Sprintf("bytes=%d-%d", offset, size-1))
+		},
+		onFallback: func() {
+			router.emit(Event{Level: "warning", Code: "segmented_download_degraded", Repository: repository, Digest: digest, Message: "temporary segmented storage failed; continued as a single resumable stream"})
+		},
+	}
 	var group sync.WaitGroup
 	for index := range segments {
 		ready[index] = make(chan error, 1)
@@ -163,13 +178,13 @@ func (router *Router) downloadSegment(ctx context.Context, repository, digest st
 	}
 	file, err := os.CreateTemp(directory, ".drg-segment-*")
 	if err != nil {
-		return err
+		return segmentStorageError{err}
 	}
 	target.path = file.Name()
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		_ = os.Remove(target.path)
-		return err
+		return segmentStorageError{err}
 	}
 	expected := target.end - target.physicalStart + 1
 	count, copyErr := io.Copy(file, io.LimitReader(blob.Reader, expected))
@@ -177,12 +192,12 @@ func (router *Router) downloadSegment(ctx context.Context, repository, digest st
 	if copyErr != nil || closeErr != nil || count != expected {
 		_ = os.Remove(target.path)
 		if copyErr != nil {
-			return copyErr
+			return segmentStorageError{copyErr}
 		}
 		if closeErr != nil {
-			return closeErr
+			return segmentStorageError{closeErr}
 		}
-		return io.ErrUnexpectedEOF
+		return segmentStorageError{io.ErrUnexpectedEOF}
 	}
 	return nil
 }
@@ -241,18 +256,39 @@ func compareRanges(left *os.File, leftOffset int64, right *os.File, rightOffset 
 }
 
 type segmentedReader struct {
-	segments  []segment
-	ready     []chan error
-	done      <-chan struct{}
-	cancel    context.CancelFunc
-	current   int
-	file      *os.File
-	remaining int64
-	release   func()
-	once      sync.Once
+	ctx             context.Context
+	segments        []segment
+	ready           []chan error
+	done            <-chan struct{}
+	cancel          context.CancelFunc
+	current         int
+	file            *os.File
+	remaining       int64
+	release         func()
+	fallbackOpen    func(int64) (registry.Blob, error)
+	onFallback      func()
+	fallback        io.ReadCloser
+	delivered       int64
+	pendingFallback error
+	digest          string
+	size            int64
+	once            sync.Once
 }
 
+type segmentStorageError struct{ err error }
+
+func (err segmentStorageError) Error() string { return err.err.Error() }
+func (err segmentStorageError) Unwrap() error { return err.err }
+
 func (reader *segmentedReader) Read(buffer []byte) (int, error) {
+	if reader.fallback != nil {
+		return reader.readFallback(buffer)
+	}
+	if reader.pendingFallback != nil {
+		cause := reader.pendingFallback
+		reader.pendingFallback = nil
+		return reader.startFallback(buffer, cause)
+	}
 	for {
 		if reader.current >= len(reader.segments) {
 			reader.cleanup()
@@ -260,23 +296,35 @@ func (reader *segmentedReader) Read(buffer []byte) (int, error) {
 		}
 		if reader.file == nil {
 			if err := <-reader.ready[reader.current]; err != nil {
+				if reader.shouldFallback(err) {
+					return reader.startFallback(buffer, err)
+				}
 				reader.cleanup()
 				return 0, err
 			}
 			segment := reader.segments[reader.current]
 			if reader.current > 0 {
 				if err := verifySegmentOverlap(reader.segments[reader.current-1], segment); err != nil {
+					if reader.shouldFallback(err) {
+						return reader.startFallback(buffer, err)
+					}
 					reader.cleanup()
 					return 0, err
 				}
 			}
 			file, err := os.Open(segment.path)
 			if err != nil {
+				if reader.shouldFallback(err) {
+					return reader.startFallback(buffer, err)
+				}
 				reader.cleanup()
 				return 0, err
 			}
 			if _, err := file.Seek(segment.start-segment.physicalStart, io.SeekStart); err != nil {
 				_ = file.Close()
+				if reader.shouldFallback(err) {
+					return reader.startFallback(buffer, err)
+				}
 				reader.cleanup()
 				return 0, err
 			}
@@ -294,7 +342,15 @@ func (reader *segmentedReader) Read(buffer []byte) (int, error) {
 		}
 		count, err := reader.file.Read(buffer[:limit])
 		reader.remaining -= int64(count)
+		reader.delivered += int64(count)
 		if err != nil && !errors.Is(err, io.EOF) {
+			if reader.shouldFallback(err) {
+				if count > 0 {
+					reader.pendingFallback = err
+					return count, nil
+				}
+				return reader.startFallback(buffer, err)
+			}
 			reader.cleanup()
 			return count, err
 		}
@@ -309,13 +365,59 @@ func (reader *segmentedReader) Read(buffer []byte) (int, error) {
 		if count > 0 {
 			return count, nil
 		}
+		if reader.shouldFallback(io.ErrUnexpectedEOF) {
+			return reader.startFallback(buffer, io.ErrUnexpectedEOF)
+		}
 		reader.cleanup()
 		return 0, io.ErrUnexpectedEOF
 	}
 }
 
+func (reader *segmentedReader) shouldFallback(err error) bool {
+	if reader == nil || reader.fallbackOpen == nil || reader.ctx == nil || reader.ctx.Err() != nil {
+		return false
+	}
+	var storageFailure segmentStorageError
+	if errors.As(err, &storageFailure) {
+		return true
+	}
+	var pathFailure *os.PathError
+	return errors.As(err, &pathFailure)
+}
+
+func (reader *segmentedReader) startFallback(buffer []byte, cause error) (int, error) {
+	reader.cleanup()
+	blob, err := reader.fallbackOpen(reader.delivered)
+	if err != nil || !validResumedBlob(blob, reader.digest, reader.delivered, reader.size-1, reader.size) {
+		if blob.Reader != nil {
+			_ = blob.Reader.Close()
+		}
+		return 0, fmt.Errorf("segmented download storage failure and single-stream fallback failed: %w", cause)
+	}
+	reader.fallback = blob.Reader
+	if reader.onFallback != nil {
+		reader.onFallback()
+	}
+	return reader.readFallback(buffer)
+}
+
+func (reader *segmentedReader) readFallback(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	count, err := reader.fallback.Read(buffer)
+	reader.delivered += int64(count)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return count, err
+	}
+	return count, err
+}
+
 func (reader *segmentedReader) Close() error {
 	reader.cleanup()
+	if reader.fallback != nil {
+		return reader.fallback.Close()
+	}
 	return nil
 }
 
