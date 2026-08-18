@@ -10,7 +10,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/hjx/docker-registry-gateway/internal/lease"
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 )
 
@@ -30,6 +32,8 @@ type Options struct {
 	Salt                     []byte
 	NoRangeRestartEnabled    *bool
 	MaxNoRangeRestartDiscard int64
+	DecisionLease            time.Duration
+	LeaseStore               *lease.Store
 }
 
 // Router implements the downstream Registry backend using multiple Providers.
@@ -40,6 +44,8 @@ type Router struct {
 	salt                     []byte
 	noRangeRestartEnabled    bool
 	maxNoRangeRestartDiscard int64
+	decisionLease            time.Duration
+	leaseStore               *lease.Store
 }
 
 // New creates a Router. Configuration validation guarantees sources contain
@@ -68,11 +74,43 @@ func New(sources []Source, options Options) *Router {
 		salt:                     append([]byte(nil), options.Salt...),
 		noRangeRestartEnabled:    noRangeRestartEnabled,
 		maxNoRangeRestartDiscard: maxNoRangeRestartDiscard,
+		decisionLease:            options.DecisionLease,
+		leaseStore:               options.LeaseStore,
 	}
 }
 
-// Manifest concurrently asks resolver Sources and selects a majority digest.
+// Manifest resolves a mutable reference once per lease, then always serves the
+// selected immutable digest through a Pull Provider. Digest references bypass
+// Resolver voting entirely.
 func (router *Router) Manifest(ctx context.Context, repository, reference string, accepts []string) (registry.Manifest, error) {
+	if isDigestReference(reference) {
+		return router.pullManifest(ctx, repository, reference, accepts)
+	}
+	key := leaseKey(repository, reference, accepts)
+	if router.leaseStore != nil && router.decisionLease > 0 {
+		if digest, found, err := router.leaseStore.Get(key, time.Now()); err == nil && found {
+			return router.pullManifest(ctx, repository, digest, accepts)
+		}
+	}
+	selection, err := router.resolveManifest(ctx, repository, reference, accepts)
+	if err != nil {
+		return registry.Manifest{}, err
+	}
+	manifest, err := router.pullManifest(ctx, repository, selection.Digest, accepts)
+	if err != nil {
+		return registry.Manifest{}, err
+	}
+	if router.leaseStore != nil && router.decisionLease > 0 {
+		// A disk error must not turn a successful pull into an unavailable
+		// response. The current process still has the selected immutable
+		// result and a later resolution can recover persistence.
+		_ = router.leaseStore.Put(key, selection.Digest, time.Now().Add(router.decisionLease))
+	}
+	return manifest, nil
+}
+
+// resolveManifest concurrently asks resolver Sources and selects a digest.
+func (router *Router) resolveManifest(ctx context.Context, repository, reference string, accepts []string) (registry.Manifest, error) {
 	type result struct {
 		index    int
 		manifest registry.Manifest
@@ -150,6 +188,42 @@ func (router *Router) Manifest(ctx context.Context, repository, reference string
 		return ordered[0].manifest, nil
 	}
 	return router.breakTie(repository, reference, accepts, ordered)
+}
+
+func (router *Router) pullManifest(ctx context.Context, repository, digest string, accepts []string) (registry.Manifest, error) {
+	for _, source := range router.sources {
+		if !source.PullProvider || source.Backend == nil {
+			continue
+		}
+		manifest, err := source.Backend.Manifest(ctx, repository, digest, accepts)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(manifest.Digest, digest) && manifest.MediaType != "" {
+			return manifest, nil
+		}
+	}
+	return registry.Manifest{}, registry.ErrUnavailable
+}
+
+func isDigestReference(reference string) bool {
+	return strings.Contains(strings.TrimSpace(reference), ":")
+}
+
+func leaseKey(repository, reference string, accepts []string) string {
+	unique := make(map[string]struct{}, len(accepts))
+	for _, accept := range accepts {
+		value := strings.TrimSpace(accept)
+		if value != "" {
+			unique[value] = struct{}{}
+		}
+	}
+	canonicalAccepts := make([]string, 0, len(unique))
+	for accept := range unique {
+		canonicalAccepts = append(canonicalAccepts, accept)
+	}
+	sort.Strings(canonicalAccepts)
+	return strings.Join([]string{repository, reference, strings.Join(canonicalAccepts, "\x1f")}, "\x00")
 }
 
 func (router *Router) byProviderPriority(candidates []*candidate) (registry.Manifest, bool) {

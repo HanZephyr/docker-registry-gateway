@@ -6,7 +6,9 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hjx/docker-registry-gateway/internal/lease"
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/router"
 )
@@ -34,8 +36,8 @@ func TestManifestUsesLowestConfiguredResolverPriority(t *testing.T) {
 	preferredPriority := 10
 	fallbackPriority := 20
 	gateway := router.New([]router.Source{
-		{Name: "fallback", Resolver: true, Priority: &fallbackPriority, Backend: fakeBackend{manifest: registry.Manifest{Digest: "sha256:fallback", Content: []byte("fallback")}}},
-		{Name: "preferred", Resolver: true, Priority: &preferredPriority, Backend: fakeBackend{manifest: registry.Manifest{Digest: "sha256:preferred", Content: []byte("preferred")}}},
+		{Name: "fallback", Resolver: true, PullProvider: true, Priority: &fallbackPriority, Backend: fakeBackend{manifest: registry.Manifest{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: "sha256:fallback", Content: []byte("fallback")}}},
+		{Name: "preferred", Resolver: true, PullProvider: true, Priority: &preferredPriority, Backend: fakeBackend{manifest: registry.Manifest{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: "sha256:preferred", Content: []byte("preferred")}}},
 	}, router.Options{ConflictStrategy: "provider_priority"})
 
 	manifest, err := gateway.Manifest(context.Background(), "library/nginx", "latest", nil)
@@ -44,6 +46,41 @@ func TestManifestUsesLowestConfiguredResolverPriority(t *testing.T) {
 	}
 	if got, want := manifest.Digest, "sha256:preferred"; got != want {
 		t.Errorf("digest = %q, want the lowest-priority-number resolver result %q", got, want)
+	}
+}
+
+func TestManifestLeaseKeepsTagOnTheSelectedDigest(t *testing.T) {
+	t.Parallel()
+
+	store, err := lease.Open("", time.Now())
+	if err != nil {
+		t.Fatalf("lease.Open() error = %v", err)
+	}
+	resolverCalls := 0
+	resolvedDigest := "sha256:first"
+	resolver := functionBackend{manifest: func(context.Context, string, string, []string) (registry.Manifest, error) {
+		resolverCalls++
+		return registry.Manifest{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: resolvedDigest, Content: []byte(resolvedDigest)}, nil
+	}}
+	pull := functionBackend{manifest: func(_ context.Context, _ string, reference string, _ []string) (registry.Manifest, error) {
+		return registry.Manifest{MediaType: "application/vnd.oci.image.manifest.v1+json", Digest: reference, Content: []byte(reference)}, nil
+	}}
+	gateway := router.New([]router.Source{
+		{Name: "resolver", Resolver: true, Backend: resolver},
+		{Name: "pull", PullProvider: true, Backend: pull},
+	}, router.Options{DecisionLease: time.Minute, LeaseStore: store})
+
+	first, err := gateway.Manifest(context.Background(), "library/nginx", "latest", nil)
+	if err != nil || first.Digest != "sha256:first" {
+		t.Fatalf("first Manifest() = %#v, %v; want first digest", first, err)
+	}
+	resolvedDigest = "sha256:second"
+	second, err := gateway.Manifest(context.Background(), "library/nginx", "latest", nil)
+	if err != nil || second.Digest != "sha256:first" {
+		t.Fatalf("leased Manifest() = %#v, %v; want first digest", second, err)
+	}
+	if resolverCalls != 1 {
+		t.Errorf("resolver calls = %d, want 1 because the second request uses the lease", resolverCalls)
 	}
 }
 
@@ -153,14 +190,21 @@ type fakeBackend struct {
 }
 
 type functionBackend struct {
-	blob func(context.Context, string, string, string) (registry.Blob, error)
+	manifest func(context.Context, string, string, []string) (registry.Manifest, error)
+	blob     func(context.Context, string, string, string) (registry.Blob, error)
 }
 
-func (backend functionBackend) Manifest(context.Context, string, string, []string) (registry.Manifest, error) {
-	return registry.Manifest{}, registry.ErrNotFound
+func (backend functionBackend) Manifest(ctx context.Context, repository, reference string, accepts []string) (registry.Manifest, error) {
+	if backend.manifest == nil {
+		return registry.Manifest{}, registry.ErrNotFound
+	}
+	return backend.manifest(ctx, repository, reference, accepts)
 }
 
 func (backend functionBackend) Blob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
+	if backend.blob == nil {
+		return registry.Blob{}, registry.ErrNotFound
+	}
 	return backend.blob(ctx, repository, digest, rangeHeader)
 }
 

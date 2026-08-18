@@ -11,6 +11,7 @@ import (
 
 	"github.com/hjx/docker-registry-gateway/internal/cli"
 	"github.com/hjx/docker-registry-gateway/internal/control"
+	"github.com/hjx/docker-registry-gateway/internal/lease"
 )
 
 func TestRunOnboardGuidesUserAndCreatesConfiguration(t *testing.T) {
@@ -177,10 +178,18 @@ providers:
 		t.Fatalf("start control server: %v", err)
 	}
 	defer server.Close()
+	leaseStore, err := lease.Open(filepath.Join(dataDir, "decision-leases.json"), time.Now())
+	if err != nil {
+		t.Fatalf("open lease store: %v", err)
+	}
+	if err := leaseStore.Put("library/nginx\x00latest\x00application/oci", "sha256:stable", time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("seed lease store: %v", err)
+	}
 
 	for _, command := range [][]string{
 		{"status", "--config", configPath},
 		{"reload", "--config", configPath},
+		{"resolver", "invalidate", "--config", configPath, "library/nginx:latest"},
 		{"stop", "--force", "--config", configPath},
 	} {
 		var output bytes.Buffer
@@ -189,8 +198,15 @@ providers:
 			t.Fatalf("drg %s exit code = %d, stderr = %s", command[0], exitCode, errors.String())
 		}
 	}
-	if reloads != 1 {
-		t.Errorf("reload count = %d, want 1", reloads)
+	if reloads != 2 {
+		t.Errorf("reload count = %d, want 2", reloads)
+	}
+	updatedLeaseStore, err := lease.Open(filepath.Join(dataDir, "decision-leases.json"), time.Now())
+	if err != nil {
+		t.Fatalf("reopen invalidated lease store: %v", err)
+	}
+	if _, found, err := updatedLeaseStore.Get("library/nginx\x00latest\x00application/oci", time.Now()); err != nil || found {
+		t.Errorf("invalidated lease = (%t, %v), want absent", found, err)
 	}
 	select {
 	case forcedStop := <-stopped:

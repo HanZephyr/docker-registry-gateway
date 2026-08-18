@@ -21,6 +21,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
 	"github.com/hjx/docker-registry-gateway/internal/gateway"
+	"github.com/hjx/docker-registry-gateway/internal/lease"
 	"github.com/hjx/docker-registry-gateway/internal/localca"
 	"github.com/hjx/docker-registry-gateway/internal/onboard"
 	"github.com/hjx/docker-registry-gateway/internal/provider"
@@ -53,6 +54,8 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runStop(ctx, arguments[1:], output, errorOutput)
 	case "restart":
 		return runRestart(ctx, arguments[1:], output, errorOutput)
+	case "resolver":
+		return runResolver(ctx, arguments[1:], output, errorOutput)
 	case "tls":
 		return runTLS(ctx, arguments[1:], output, errorOutput)
 	case "help", "--help", "-h":
@@ -189,6 +192,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		listeners = append(listeners, tls.NewListener(listener, server.TLSConfig))
 	}
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
+	currentConfig := loaded
 	probeContext, stopProbing := context.WithCancel(ctx)
 	var probeMu sync.Mutex
 	var probeGroup sync.WaitGroup
@@ -225,14 +229,23 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			if err != nil {
 				return fmt.Errorf("读取或校验新配置: %w", err)
 			}
-			if !sameServeConfiguration(loaded, candidate) {
+			if !sameServeConfiguration(currentConfig, candidate) {
 				return errors.New("监听地址、访问地址、TLS 模式或 data_dir 已改变，需要使用 drg restart")
+			}
+			if resolverConfigurationChanged(currentConfig, candidate) {
+				store, storeErr := lease.Open(filepath.Join(currentConfig.DataDir, "decision-leases.json"), time.Now())
+				if storeErr == nil {
+					if err := store.Clear(); err != nil {
+						return fmt.Errorf("清空旧解析租约: %w", err)
+					}
+				}
 			}
 			replacement, err := buildRouter(candidate, []byte(absConfigPath))
 			if err != nil {
 				return err
 			}
 			backend.Replace(replacement)
+			currentConfig = candidate
 			launchProbe(candidate)
 			return nil
 		},
@@ -365,13 +378,62 @@ func buildRouter(loaded config.Config, salt []byte) (*router.Router, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取无 Range 重拉预算: %w", err)
 	}
+	decisionLease, err := time.ParseDuration(loaded.Resolution.DecisionLease)
+	if err != nil {
+		return nil, fmt.Errorf("读取解析租约时长: %w", err)
+	}
+	leaseStore, err := lease.Open(filepath.Join(loaded.DataDir, "decision-leases.json"), time.Now())
+	if err != nil {
+		// A damaged historical lease must not prevent image pulls. The Router
+		// continues with a process-local lease until an operator can inspect
+		// or replace the malformed file.
+		leaseStore, _ = lease.Open("", time.Now())
+	}
 	return router.New(sources, router.Options{
 		ConflictStrategy:         loaded.Resolution.ConflictStrategy,
 		TieBreaker:               loaded.Resolution.TieBreaker,
 		Salt:                     salt,
 		NoRangeRestartEnabled:    &loaded.AllowNonRangeProviders,
 		MaxNoRangeRestartDiscard: maxNoRangeRestartDiscard,
+		DecisionLease:            decisionLease,
+		LeaseStore:               leaseStore,
 	}), nil
+}
+
+func resolverConfigurationChanged(current, candidate config.Config) bool {
+	if current.Resolution.ConflictStrategy != candidate.Resolution.ConflictStrategy ||
+		current.Resolution.TieBreaker != candidate.Resolution.TieBreaker ||
+		current.Resolution.DecisionLease != candidate.Resolution.DecisionLease {
+		return true
+	}
+	leftResolvers := resolverSignature(current.Providers)
+	rightResolvers := resolverSignature(candidate.Providers)
+	if len(leftResolvers) != len(rightResolvers) {
+		return true
+	}
+	for index := range leftResolvers {
+		if leftResolvers[index] != rightResolvers[index] {
+			return true
+		}
+	}
+	return false
+}
+
+func resolverSignature(providers []config.Provider) []string {
+	result := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		if provider.Resolver {
+			result = append(result, strings.Join([]string{provider.Name, provider.URL, priorityValue(provider.Priority)}, "\x00"))
+		}
+	}
+	return result
+}
+
+func priorityValue(value *int) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *value)
 }
 
 func sameServeConfiguration(current, candidate config.Config) bool {
@@ -538,6 +600,74 @@ func runRestart(ctx context.Context, arguments []string, output, errorOutput io.
 	return 1
 }
 
+func runResolver(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	if len(arguments) == 0 || arguments[0] != "invalidate" {
+		fmt.Fprintln(errorOutput, "用法：drg resolver invalidate [--all | <镜像:tag>] --config <路径>")
+		return 2
+	}
+	flags := flag.NewFlagSet("resolver invalidate", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	all := flags.Bool("all", false, "清空全部解析租约")
+	if err := flags.Parse(arguments[1:]); err != nil {
+		return 2
+	}
+	if (*all && flags.NArg() != 0) || (!*all && flags.NArg() != 1) {
+		fmt.Fprintln(errorOutput, "用法：drg resolver invalidate [--all | <镜像:tag>] --config <路径>")
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return 1
+	}
+	store, err := lease.Open(filepath.Join(loaded.DataDir, "decision-leases.json"), time.Now())
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取解析租约失败: %v\n", err)
+		return 1
+	}
+	if *all {
+		err = store.Clear()
+	} else {
+		repository, tag, parseErr := splitMutableReference(flags.Arg(0))
+		if parseErr != nil {
+			fmt.Fprintf(errorOutput, "镜像引用无效: %v\n", parseErr)
+			return 2
+		}
+		err = store.DeletePrefix(repository + "\x00" + tag + "\x00")
+	}
+	if err != nil {
+		fmt.Fprintf(errorOutput, "写入解析租约失败: %v\n", err)
+		return 1
+	}
+	if err := control.ReloadRequest(ctx, loaded.DataDir); err != nil {
+		fmt.Fprintf(errorOutput, "租约文件已清空，但运行中服务尚未切换到新状态: %v\n", err)
+		return 1
+	}
+	if *all {
+		fmt.Fprintln(output, "全部解析租约已失效，运行中服务已热加载。")
+	} else {
+		fmt.Fprintf(output, "镜像 %s 的解析租约已失效，运行中服务已热加载。\n", flags.Arg(0))
+	}
+	return 0
+}
+
+func splitMutableReference(value string) (string, string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "@") {
+		return "", "", errors.New("需要一个可变 tag 引用，例如 library/nginx:latest")
+	}
+	lastSlash := strings.LastIndex(value, "/")
+	lastColon := strings.LastIndex(value, ":")
+	if lastColon > lastSlash {
+		if lastColon == 0 || lastColon == len(value)-1 {
+			return "", "", errors.New("tag 引用格式不完整")
+		}
+		return value[:lastColon], value[lastColon+1:], nil
+	}
+	return value, "latest", nil
+}
+
 func loadControlConfiguration(command string, arguments []string, errorOutput io.Writer) (config.Config, int) {
 	loaded, _, exitCode := loadControlConfigurationWithPath(command, arguments, errorOutput)
 	return loaded, exitCode
@@ -682,4 +812,5 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  reload  校验并热加载主配置")
 	fmt.Fprintln(output, "  stop [--force]  平滑或强制停止本地 Gateway")
 	fmt.Fprintln(output, "  restart [--force]  停止并重新启动本地 Gateway")
+	fmt.Fprintln(output, "  resolver invalidate  使一个或全部 tag 解析租约失效")
 }
