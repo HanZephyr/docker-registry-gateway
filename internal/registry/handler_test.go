@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
@@ -126,6 +127,21 @@ func TestHandlerRejectsGatewayRouteThatReturnsToThisInstance(t *testing.T) {
 	}
 }
 
+func TestHandlerReturnsProviderRateLimitToDockerWithRetryHint(t *testing.T) {
+	handler := registry.NewHandler(errorBackend{err: registry.NewFailure(registry.FailureRateLimited, 15*time.Second, nil)})
+	request := httptest.NewRequest(http.MethodGet, "https://drg.localhost:5443/v2/library/nginx/manifests/latest", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusTooManyRequests; got != want {
+		t.Fatalf("status = %d, want %d; body = %s", got, want, response.Body.String())
+	}
+	if got, want := response.Header().Get("Retry-After"), "15"; got != want {
+		t.Errorf("Retry-After = %q, want %q", got, want)
+	}
+}
+
 type fakeBackend struct {
 	manifest   registry.Manifest
 	blob       []byte
@@ -142,6 +158,16 @@ func (backend *countingBackend) Manifest(_ context.Context, _, _ string, _ []str
 func (backend *countingBackend) Blob(_ context.Context, _, _, _ string) (registry.Blob, error) {
 	backend.calls++
 	return registry.Blob{}, registry.ErrUnavailable
+}
+
+type errorBackend struct{ err error }
+
+func (backend errorBackend) Manifest(context.Context, string, string, []string) (registry.Manifest, error) {
+	return registry.Manifest{}, backend.err
+}
+
+func (backend errorBackend) Blob(context.Context, string, string, string) (registry.Blob, error) {
+	return registry.Blob{}, backend.err
 }
 
 func (backend fakeBackend) Manifest(_ context.Context, repository, reference string, _ []string) (registry.Manifest, error) {

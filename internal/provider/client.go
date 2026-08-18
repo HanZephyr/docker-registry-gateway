@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
@@ -44,7 +45,12 @@ type Client struct {
 	routeGuard routeguard.Guard
 
 	mu     sync.Mutex
-	tokens map[string]string
+	tokens map[string]tokenEntry
+}
+
+type tokenEntry struct {
+	value     string
+	challenge string
 }
 
 // ProbeResult summarizes the non-destructive admission check for a Provider.
@@ -95,7 +101,7 @@ func New(options Options) (*Client, error) {
 		password:   options.Password,
 		http:       client,
 		routeGuard: options.RouteGuard,
-		tokens:     make(map[string]string),
+		tokens:     make(map[string]tokenEntry),
 	}, nil
 }
 
@@ -109,7 +115,7 @@ func (client *Client) Probe(ctx context.Context, reference string) (ProbeResult,
 	}
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return ProbeResult{}, mapStatus(response.StatusCode)
+		return ProbeResult{}, mapResponseStatus(response)
 	}
 	repository, tagOrDigest, err := splitProbeReference(reference)
 	if err != nil {
@@ -168,7 +174,7 @@ func (client *Client) Manifest(ctx context.Context, repository, reference string
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return registry.Manifest{}, mapStatus(response.StatusCode)
+		return registry.Manifest{}, mapResponseStatus(response)
 	}
 	contents, err := io.ReadAll(io.LimitReader(response.Body, maxManifestBytes+1))
 	if err != nil {
@@ -180,13 +186,13 @@ func (client *Client) Manifest(ctx context.Context, repository, reference string
 	digest := strings.TrimSpace(response.Header.Get("Docker-Content-Digest"))
 	if digest != "" {
 		if err := verifyDigest(digest, contents); err != nil {
-			return registry.Manifest{}, fmt.Errorf("upstream manifest content digest: %w", err)
+			return registry.Manifest{}, registry.NewFailure(registry.FailureIntegrity, 0, fmt.Errorf("upstream manifest content digest: %w", err))
 		}
 	} else {
 		digest = sha256Digest(contents)
 	}
 	if isDigestReference(reference) && !strings.EqualFold(reference, digest) {
-		return registry.Manifest{}, fmt.Errorf("upstream manifest digest differs from requested digest: %w", registry.ErrUnavailable)
+		return registry.Manifest{}, registry.NewFailure(registry.FailureIntegrity, 0, errors.New("upstream manifest digest differs from requested digest"))
 	}
 	return registry.Manifest{
 		MediaType: strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0]),
@@ -209,7 +215,7 @@ func (client *Client) Blob(ctx context.Context, repository, digest, rangeHeader 
 	if rangeHeader != "" {
 		if response.StatusCode != http.StatusPartialContent {
 			response.Body.Close()
-			return registry.Blob{}, mapStatus(response.StatusCode)
+			return registry.Blob{}, mapResponseStatus(response)
 		}
 		start, end, size, err := parseContentRange(response.Header.Get("Content-Range"))
 		if err != nil {
@@ -225,7 +231,7 @@ func (client *Client) Blob(ctx context.Context, repository, digest, rangeHeader 
 	}
 	if response.StatusCode != http.StatusOK {
 		response.Body.Close()
-		return registry.Blob{}, mapStatus(response.StatusCode)
+		return registry.Blob{}, mapResponseStatus(response)
 	}
 	if response.ContentLength < 0 {
 		response.Body.Close()
@@ -252,7 +258,7 @@ func (client *Client) Blob(ctx context.Context, repository, digest, rangeHeader 
 func validateBlobResponseDigest(response *http.Response, requested string) (string, error) {
 	declared := responseDigest(response, requested)
 	if !strings.EqualFold(declared, requested) {
-		return "", fmt.Errorf("upstream blob digest differs from requested digest: %w", registry.ErrUnavailable)
+		return "", registry.NewFailure(registry.FailureIntegrity, 0, errors.New("upstream blob digest differs from requested digest"))
 	}
 	return requested, nil
 }
@@ -262,18 +268,25 @@ func (client *Client) request(ctx context.Context, method string, endpoint *url.
 	if err != nil {
 		return nil, err
 	}
-	if token := client.token(scope); token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
+	cachedToken := client.token(scope)
+	if cachedToken.value != "" {
+		request.Header.Set("Authorization", "Bearer "+cachedToken.value)
 	}
 	response, err := client.http.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("request Provider: %w", err)
 	}
-	if response.StatusCode != http.StatusUnauthorized {
+	if response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusForbidden {
 		return response, nil
 	}
 	challenge := response.Header.Get("WWW-Authenticate")
 	response.Body.Close()
+	if challenge == "" {
+		challenge = cachedToken.challenge
+	}
+	if challenge == "" {
+		return nil, registry.NewFailure(registry.FailureAuthentication, 0, nil)
+	}
 	token, err := client.obtainToken(ctx, challenge, scope)
 	if err != nil {
 		return nil, err
@@ -336,7 +349,7 @@ func (client *Client) obtainToken(ctx context.Context, challenge, scope string) 
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", mapStatus(response.StatusCode)
+		return "", mapResponseStatus(response)
 	}
 	var tokenResponse struct {
 		Token       string `json:"token"`
@@ -353,12 +366,12 @@ func (client *Client) obtainToken(ctx context.Context, challenge, scope string) 
 		return "", errors.New("Provider token response contains no token")
 	}
 	client.mu.Lock()
-	client.tokens[scope] = token
+	client.tokens[scope] = tokenEntry{value: token, challenge: challenge}
 	client.mu.Unlock()
 	return token, nil
 }
 
-func (client *Client) token(scope string) string {
+func (client *Client) token(scope string) tokenEntry {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return client.tokens[scope]
@@ -456,11 +469,30 @@ func isDigestReference(reference string) bool {
 	return found && algorithm != "" && value != ""
 }
 
-func mapStatus(status int) error {
-	if status == http.StatusNotFound {
+func mapResponseStatus(response *http.Response) error {
+	switch response.StatusCode {
+	case http.StatusNotFound:
 		return registry.ErrNotFound
+	case http.StatusTooManyRequests:
+		return registry.NewFailure(registry.FailureRateLimited, parseRetryAfter(response.Header.Get("Retry-After")), nil)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return registry.NewFailure(registry.FailureAuthentication, 0, nil)
+	default:
+		return registry.ErrUnavailable
 	}
-	return registry.ErrUnavailable
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if deadline, err := http.ParseTime(value); err == nil {
+		if remaining := time.Until(deadline); remaining > 0 {
+			return remaining
+		}
+	}
+	return 0
 }
 
 func splitProbeReference(reference string) (string, string, error) {

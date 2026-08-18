@@ -38,6 +38,9 @@ type ProviderHealth struct {
 	Failures                 int       `json:"failures"`
 	LastSuccess              time.Time `json:"last_success,omitempty"`
 	LastFailure              time.Time `json:"last_failure,omitempty"`
+	RateLimitedUntil         time.Time `json:"rate_limited_until,omitempty"`
+	AuthenticationInvalid    bool      `json:"authentication_invalid,omitempty"`
+	IntegrityInvalid         bool      `json:"integrity_invalid,omitempty"`
 }
 
 // Callbacks bind command handling to a running Gateway instance.

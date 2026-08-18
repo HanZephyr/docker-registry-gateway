@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
@@ -291,6 +292,15 @@ func parseRange(header string, total int64) (int64, int64, bool, error) {
 
 func writeBackendError(response http.ResponseWriter, err error, notFoundCode string) {
 	switch {
+	case IsFailureKind(err, FailureRateLimited):
+		if retryAfter := RetryAfter(err); retryAfter > 0 {
+			seconds := int64(retryAfter / time.Second)
+			if retryAfter%time.Second != 0 {
+				seconds++
+			}
+			response.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		}
+		writeOCIError(response, http.StatusTooManyRequests, "TOOMANYREQUESTS", "all available providers are rate limited")
 	case errors.Is(err, ErrNotFound):
 		writeOCIError(response, http.StatusNotFound, notFoundCode, "requested content was not found")
 	case errors.Is(err, ErrUnavailable):

@@ -27,3 +27,20 @@ func TestHealthRestorePreservesThroughputButResetsFailures(t *testing.T) {
 		t.Errorf("restored failures = %d, want 0", snapshot[0].Failures)
 	}
 }
+
+func TestHealthProbeSuccessRestoresAuthenticationAndIntegrityStates(t *testing.T) {
+	t.Parallel()
+
+	health := router.NewHealth()
+	health.RecordAuthenticationFailure("provider")
+	health.RecordIntegrityViolation("provider")
+	health.RecordProbeSuccess("provider")
+
+	snapshots := health.Snapshot()
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot count = %d, want 1", len(snapshots))
+	}
+	if snapshots[0].AuthenticationInvalid || snapshots[0].IntegrityInvalid {
+		t.Errorf("probe-recovered snapshot = %#v, want no persistent exclusion", snapshots[0])
+	}
+}

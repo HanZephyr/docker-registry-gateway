@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/provider"
+	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
@@ -109,8 +111,8 @@ func TestClientRejectsManifestWithMismatchedContentDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider.New() error = %v", err)
 	}
-	if _, err := client.Manifest(context.Background(), "library/nginx", "latest", nil); err == nil {
-		t.Fatal("Manifest() error = nil, want mismatched content digest rejection")
+	if _, err := client.Manifest(context.Background(), "library/nginx", "latest", nil); !registry.IsFailureKind(err, registry.FailureIntegrity) {
+		t.Fatalf("Manifest() error = %v, want an integrity failure", err)
 	}
 }
 
@@ -146,6 +148,72 @@ func TestClientExtendsValidatedGatewayRouteOnProviderRequest(t *testing.T) {
 	}
 }
 
+func TestClientClassifiesProviderRateLimitAndPreservesRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Retry-After", "30")
+		response.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client, err := provider.New(provider.Options{URL: server.URL})
+	if err != nil {
+		t.Fatalf("provider.New() error = %v", err)
+	}
+	_, err = client.Manifest(context.Background(), "library/nginx", "latest", nil)
+	if !registry.IsFailureKind(err, registry.FailureRateLimited) {
+		t.Fatalf("Manifest() error = %v, want a rate-limited failure", err)
+	}
+	if got, want := registry.RetryAfter(err), 30*time.Second; got != want {
+		t.Errorf("RetryAfter() = %s, want %s", got, want)
+	}
+}
+
+func TestClientRefreshesCachedTokenOnceAfterForbidden(t *testing.T) {
+	manifest := []byte(`{"schemaVersion":2}`)
+	var tokenRequests, authorizedRequests int
+	authServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		tokenRequests++
+		_ = json.NewEncoder(response).Encode(map[string]string{"token": fmt.Sprintf("token-%d", tokenRequests)})
+	}))
+	defer authServer.Close()
+	registryServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Header.Get("Authorization") {
+		case "":
+			response.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q`, authServer.URL))
+			response.WriteHeader(http.StatusUnauthorized)
+		case "Bearer token-1":
+			authorizedRequests++
+			if authorizedRequests > 1 {
+				response.WriteHeader(http.StatusForbidden)
+				return
+			}
+			response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			response.Header().Set("Docker-Content-Digest", digest(manifest))
+			_, _ = response.Write(manifest)
+		case "Bearer token-2":
+			response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			response.Header().Set("Docker-Content-Digest", digest(manifest))
+			_, _ = response.Write(manifest)
+		default:
+			response.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer registryServer.Close()
+
+	client, err := provider.New(provider.Options{URL: registryServer.URL, Username: "robot", Password: "pat"})
+	if err != nil {
+		t.Fatalf("provider.New() error = %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := client.Manifest(context.Background(), "library/nginx", "latest", nil); err != nil {
+			t.Fatalf("Manifest() attempt %d error = %v", attempt+1, err)
+		}
+	}
+	if got, want := tokenRequests, 2; got != want {
+		t.Errorf("token requests = %d, want %d after one cached-token refresh", got, want)
+	}
+}
+
 func TestClientRejectsBlobThatDeclaresDifferentDigest(t *testing.T) {
 	t.Parallel()
 
@@ -161,8 +229,8 @@ func TestClientRejectsBlobThatDeclaresDifferentDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("provider.New() error = %v", err)
 	}
-	if _, err := client.Blob(context.Background(), "library/nginx", digest(contents), ""); err == nil {
-		t.Fatal("Blob() error = nil, want response digest disagreement rejection")
+	if _, err := client.Blob(context.Background(), "library/nginx", digest(contents), ""); !registry.IsFailureKind(err, registry.FailureIntegrity) {
+		t.Fatalf("Blob() error = %v, want an integrity failure", err)
 	}
 }
 

@@ -265,7 +265,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		probeGroup.Add(1)
 		go func() {
 			defer probeGroup.Done()
-			probeProviders(probeContext, configuration, probeOutput, events, routeGuard)
+			probeProviders(probeContext, configuration, probeOutput, events, routeGuard, tracker)
 		}()
 	}
 	defer func() {
@@ -364,7 +364,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	}
 }
 
-func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log, routeGuard routeguard.Guard) {
+func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log, routeGuard routeguard.Guard, tracker *router.Health) {
 	for _, configured := range loaded.Providers {
 		if parent.Err() != nil {
 			return
@@ -383,6 +383,7 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 			if err == nil {
 				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
 				if probeErr == nil {
+					tracker.RecordProbeSuccess(configured.Name)
 					_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: fmt.Sprintf("Range=%t", result.RangeSupported)})
 					if result.RangeSupported {
 						fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", configured.Name)
@@ -554,8 +555,9 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 	}
 	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；排队拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, status.QueuedPulls, strings.Join(status.Listeners, ", "))
 	for _, provider := range status.Providers {
-		fmt.Fprintf(output, "Provider %s：近期吞吐 %.2f MiB/s；本进程失败 %d；最近成功 %s；最近失败 %s\n",
+		fmt.Fprintf(output, "Provider %s：状态 %s；近期吞吐 %.2f MiB/s；本进程失败 %d；最近成功 %s；最近失败 %s\n",
 			provider.Name,
+			formatProviderState(provider),
 			provider.ThroughputBytesPerSecond/(1<<20),
 			provider.Failures,
 			formatHealthTime(provider.LastSuccess),
@@ -574,9 +576,25 @@ func providerHealthStatuses(snapshots []router.HealthSnapshot) []control.Provide
 			Failures:                 snapshot.Failures,
 			LastSuccess:              snapshot.LastSuccess,
 			LastFailure:              snapshot.LastFailure,
+			RateLimitedUntil:         snapshot.RateLimitedUntil,
+			AuthenticationInvalid:    snapshot.AuthenticationInvalid,
+			IntegrityInvalid:         snapshot.IntegrityInvalid,
 		})
 	}
 	return result
+}
+
+func formatProviderState(provider control.ProviderHealth) string {
+	switch {
+	case provider.IntegrityInvalid:
+		return "完整性隔离"
+	case provider.AuthenticationInvalid:
+		return "认证失效"
+	case provider.RateLimitedUntil.After(time.Now()):
+		return "限流至 " + provider.RateLimitedUntil.Local().Format(time.RFC3339)
+	default:
+		return "可用"
+	}
 }
 
 func formatHealthTime(value time.Time) string {

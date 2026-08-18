@@ -352,6 +352,58 @@ func TestBlobRestartsAndSkipsWhenNoRangeFallbackFitsBudget(t *testing.T) {
 	}
 }
 
+func TestBlobAvoidsRateLimitedProviderAndReturnsRetryHintWhenNoAlternative(t *testing.T) {
+	var calls int
+	rateLimited := functionBackend{blob: func(context.Context, string, string, string) (registry.Blob, error) {
+		calls++
+		return registry.Blob{}, registry.NewFailure(registry.FailureRateLimited, time.Minute, nil)
+	}}
+	gateway := router.New([]router.Source{{Name: "rate-limited", PullProvider: true, Backend: rateLimited}}, router.Options{})
+
+	for attempt := 0; attempt < 2; attempt++ {
+		_, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+		if !registry.IsFailureKind(err, registry.FailureRateLimited) {
+			t.Fatalf("Blob() attempt %d error = %v, want rate-limited failure", attempt+1, err)
+		}
+	}
+	if got, want := calls, 1; got != want {
+		t.Errorf("rate-limited Provider calls = %d, want %d after its cooldown begins", got, want)
+	}
+}
+
+func TestBlobIsolatesIntegrityViolatingProviderButUsesHealthyFallback(t *testing.T) {
+	contents := []byte("healthy")
+	var badCalls, goodCalls int
+	bad := functionBackend{blob: func(context.Context, string, string, string) (registry.Blob, error) {
+		badCalls++
+		return registry.Blob{}, registry.NewFailure(registry.FailureIntegrity, 0, nil)
+	}}
+	good := functionBackend{blob: func(_ context.Context, _ string, expected string, _ string) (registry.Blob, error) {
+		goodCalls++
+		return registry.Blob{Digest: expected, Size: int64(len(contents)), Start: 0, End: int64(len(contents) - 1), Reader: io.NopCloser(bytes.NewReader(contents))}, nil
+	}}
+	gateway := router.New([]router.Source{
+		{Name: "bad", PullProvider: true, Backend: bad},
+		{Name: "good", PullProvider: true, Backend: good},
+	}, router.Options{})
+
+	for attempt := 0; attempt < 2; attempt++ {
+		blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+		if err != nil {
+			t.Fatalf("Blob() attempt %d error = %v", attempt+1, err)
+		}
+		if err := blob.Reader.Close(); err != nil {
+			t.Fatalf("close Blob() attempt %d: %v", attempt+1, err)
+		}
+	}
+	if got, want := badCalls, 1; got != want {
+		t.Errorf("integrity-violating Provider calls = %d, want %d", got, want)
+	}
+	if got, want := goodCalls, 2; got != want {
+		t.Errorf("healthy fallback calls = %d, want %d", got, want)
+	}
+}
+
 type fakeBackend struct {
 	manifest registry.Manifest
 	blob     registry.Blob

@@ -142,12 +142,12 @@ func (router *Router) resolveManifest(ctx context.Context, repository, reference
 
 	var resolvers []int
 	for index, source := range router.sources {
-		if source.Resolver && source.Backend != nil {
+		if source.Resolver && source.Backend != nil && router.health.available(source.Name, time.Now()) {
 			resolvers = append(resolvers, index)
 		}
 	}
 	if len(resolvers) == 0 {
-		return registry.Manifest{}, registry.ErrUnavailable
+		return registry.Manifest{}, router.health.unavailableError(router.sources, true)
 	}
 
 	results := make(chan result, len(resolvers))
@@ -169,6 +169,9 @@ func (router *Router) resolveManifest(ctx context.Context, repository, reference
 	allNotFound := true
 	for result := range results {
 		if result.err != nil || result.manifest.Digest == "" {
+			if result.err != nil {
+				router.recordSourceFailure(router.sources[result.index].Name, result.err)
+			}
 			if !errors.Is(result.err, registry.ErrNotFound) {
 				allNotFound = false
 			}
@@ -214,19 +217,18 @@ func (router *Router) resolveManifest(ctx context.Context, repository, reference
 }
 
 func (router *Router) pullManifest(ctx context.Context, repository, digest string, accepts []string) (registry.Manifest, error) {
-	for _, source := range router.sources {
-		if !source.PullProvider || source.Backend == nil {
-			continue
-		}
+	for _, index := range router.health.orderedPullSourceIndexes(router.sources) {
+		source := router.sources[index]
 		manifest, err := source.Backend.Manifest(ctx, repository, digest, accepts)
 		if err != nil {
+			router.recordSourceFailure(source.Name, err)
 			continue
 		}
 		if strings.EqualFold(manifest.Digest, digest) && manifest.MediaType != "" {
 			return manifest, nil
 		}
 	}
-	return registry.Manifest{}, registry.ErrUnavailable
+	return registry.Manifest{}, router.health.unavailableError(router.sources, false)
 }
 
 func isDigestReference(reference string) bool {
@@ -309,7 +311,9 @@ func (router *Router) Blob(ctx context.Context, repository, digest, rangeHeader 
 func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
 	allNotFound := true
 	attempted := make(map[int]bool)
+	attemptedSource := false
 	for _, index := range router.health.orderedPullSourceIndexes(router.sources) {
+		attemptedSource = true
 		source := router.sources[index]
 		blob, err := source.Backend.Blob(ctx, repository, digest, rangeHeader)
 		if err == nil {
@@ -337,14 +341,17 @@ func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHea
 			return blob, nil
 		}
 		if !errors.Is(err, registry.ErrNotFound) {
-			router.health.RecordFailure(source.Name)
+			router.recordSourceFailure(source.Name, err)
 			allNotFound = false
 		}
+	}
+	if !attemptedSource {
+		return registry.Blob{}, router.health.unavailableError(router.sources, false)
 	}
 	if allNotFound {
 		return registry.Blob{}, registry.ErrNotFound
 	}
-	return registry.Blob{}, registry.ErrUnavailable
+	return registry.Blob{}, router.health.unavailableError(router.sources, false)
 }
 
 type resumableBlobReader struct {
@@ -439,12 +446,28 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 				}
 			}
 		}
-		reader.router.health.RecordFailure(source.Name)
+		reader.router.recordSourceFailure(source.Name, err)
 	}
 	if errors.Is(cause, io.EOF) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	return 0, cause
+}
+
+func (router *Router) recordSourceFailure(provider string, err error) {
+	if errors.Is(err, registry.ErrNotFound) {
+		return
+	}
+	switch {
+	case registry.IsFailureKind(err, registry.FailureRateLimited):
+		router.health.RecordRateLimited(provider, registry.RetryAfter(err))
+	case registry.IsFailureKind(err, registry.FailureAuthentication):
+		router.health.RecordAuthenticationFailure(provider)
+	case registry.IsFailureKind(err, registry.FailureIntegrity):
+		router.health.RecordIntegrityViolation(provider)
+	default:
+		router.health.RecordFailure(provider)
+	}
 }
 
 func (reader *resumableBlobReader) recordSuccess() {

@@ -4,7 +4,11 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/hjx/docker-registry-gateway/internal/registry"
 )
+
+const defaultRateLimitCooldown = time.Minute
 
 // Health keeps process-local, recent transfer quality for Provider ordering.
 // It is intentionally advisory: all Providers remain eligible until a real
@@ -20,6 +24,9 @@ type healthState struct {
 	failures                 int
 	lastSuccess              time.Time
 	lastFailure              time.Time
+	rateLimitedUntil         time.Time
+	authenticationInvalid    bool
+	integrityInvalid         bool
 }
 
 // HealthSnapshot is the non-secret portion of Provider transfer history. A
@@ -31,6 +38,9 @@ type HealthSnapshot struct {
 	Failures                 int
 	LastSuccess              time.Time
 	LastFailure              time.Time
+	RateLimitedUntil         time.Time
+	AuthenticationInvalid    bool
+	IntegrityInvalid         bool
 }
 
 // NewHealth creates an empty tracker with no artificial preference.
@@ -56,6 +66,9 @@ func (health *Health) RecordSuccess(provider string, bytes int64, elapsed time.D
 	}
 	state.failures = 0
 	state.lastSuccess = time.Now().UTC()
+	state.rateLimitedUntil = time.Time{}
+	state.authenticationInvalid = false
+	state.integrityInvalid = false
 	health.states[provider] = state
 }
 
@@ -68,6 +81,64 @@ func (health *Health) RecordFailure(provider string) {
 	defer health.mu.Unlock()
 	state := health.states[provider]
 	state.failures++
+	state.lastFailure = time.Now().UTC()
+	health.states[provider] = state
+}
+
+// RecordRateLimited holds a Provider out of selection until the upstream's
+// retry window has passed. A missing upstream hint gets a conservative,
+// internal cooldown rather than a user-tunable download timeout.
+func (health *Health) RecordRateLimited(provider string, retryAfter time.Duration) {
+	if health == nil || provider == "" {
+		return
+	}
+	if retryAfter <= 0 {
+		retryAfter = defaultRateLimitCooldown
+	}
+	now := time.Now().UTC()
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	state := health.states[provider]
+	state.rateLimitedUntil = now.Add(retryAfter)
+	state.lastFailure = now
+	health.states[provider] = state
+}
+
+// RecordAuthenticationFailure removes a Provider until a reload, probe, or a
+// subsequent successful transfer proves that its upstream identity recovered.
+func (health *Health) RecordAuthenticationFailure(provider string) {
+	health.recordUnavailable(provider, func(state *healthState) { state.authenticationInvalid = true })
+}
+
+// RecordIntegrityViolation isolates content that disagreed with its selected
+// digest. It is intentionally stronger than an ordinary transient failure.
+func (health *Health) RecordIntegrityViolation(provider string) {
+	health.recordUnavailable(provider, func(state *healthState) { state.integrityInvalid = true })
+}
+
+// RecordProbeSuccess restores a Provider after a fresh V2/manifest/blob
+// admission probe without discarding its historical throughput observation.
+func (health *Health) RecordProbeSuccess(provider string) {
+	if health == nil || provider == "" {
+		return
+	}
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	state := health.states[provider]
+	state.rateLimitedUntil = time.Time{}
+	state.authenticationInvalid = false
+	state.integrityInvalid = false
+	health.states[provider] = state
+}
+
+func (health *Health) recordUnavailable(provider string, mutate func(*healthState)) {
+	if health == nil || provider == "" {
+		return
+	}
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	state := health.states[provider]
+	mutate(&state)
 	state.lastFailure = time.Now().UTC()
 	health.states[provider] = state
 }
@@ -87,6 +158,9 @@ func (health *Health) Snapshot() []HealthSnapshot {
 			Failures:                 state.failures,
 			LastSuccess:              state.lastSuccess,
 			LastFailure:              state.lastFailure,
+			RateLimitedUntil:         state.rateLimitedUntil,
+			AuthenticationInvalid:    state.authenticationInvalid,
+			IntegrityInvalid:         state.integrityInvalid,
 		})
 	}
 	sort.Slice(result, func(left, right int) bool {
@@ -116,6 +190,9 @@ func (health *Health) Restore(snapshots []HealthSnapshot) {
 		state.lastSuccess = snapshot.LastSuccess.UTC()
 		state.lastFailure = snapshot.LastFailure.UTC()
 		state.failures = 0
+		state.rateLimitedUntil = time.Time{}
+		state.authenticationInvalid = false
+		state.integrityInvalid = false
 		health.states[snapshot.Provider] = state
 	}
 }
@@ -123,7 +200,7 @@ func (health *Health) Restore(snapshots []HealthSnapshot) {
 func (health *Health) orderedPullSourceIndexes(sources []Source) []int {
 	indexes := make([]int, 0, len(sources))
 	for index, source := range sources {
-		if source.PullProvider && source.Backend != nil {
+		if source.PullProvider && source.Backend != nil && health.available(source.Name, time.Now()) {
 			indexes = append(indexes, index)
 		}
 	}
@@ -148,6 +225,46 @@ func (health *Health) orderedPullSourceIndexes(sources []Source) []int {
 		return configuredSourcePrecedes(leftSource, rightSource, indexes[left], indexes[right])
 	})
 	return indexes
+}
+
+func (health *Health) available(provider string, now time.Time) bool {
+	if health == nil {
+		return true
+	}
+	health.mu.RLock()
+	state := health.states[provider]
+	health.mu.RUnlock()
+	return !state.authenticationInvalid && !state.integrityInvalid && !state.rateLimitedUntil.After(now)
+}
+
+func (health *Health) unavailableError(sources []Source, resolver bool) error {
+	if health == nil {
+		return registry.ErrUnavailable
+	}
+	now := time.Now()
+	allRateLimited := true
+	hasCandidate := false
+	var earliest time.Time
+	health.mu.RLock()
+	defer health.mu.RUnlock()
+	for _, source := range sources {
+		if source.Backend == nil || (resolver && !source.Resolver) || (!resolver && !source.PullProvider) {
+			continue
+		}
+		hasCandidate = true
+		state := health.states[source.Name]
+		if !state.rateLimitedUntil.After(now) || state.authenticationInvalid || state.integrityInvalid {
+			allRateLimited = false
+			continue
+		}
+		if earliest.IsZero() || state.rateLimitedUntil.Before(earliest) {
+			earliest = state.rateLimitedUntil
+		}
+	}
+	if hasCandidate && allRateLimited && !earliest.IsZero() {
+		return registry.NewFailure(registry.FailureRateLimited, time.Until(earliest), nil)
+	}
+	return registry.ErrUnavailable
 }
 
 func configuredSourcePrecedes(left, right Source, leftIndex, rightIndex int) bool {
