@@ -21,24 +21,27 @@ import (
 	"sync"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
 const maxManifestBytes = 10 << 20
 
 // Options configures one upstream Provider client.
 type Options struct {
-	URL      string
-	Username string
-	Password string
-	CAFile   string
+	URL        string
+	Username   string
+	Password   string
+	CAFile     string
+	RouteGuard routeguard.Guard
 }
 
 // Client is a direct Registry V2 client with short-lived Bearer token reuse.
 type Client struct {
-	baseURL  *url.URL
-	username string
-	password string
-	http     *http.Client
+	baseURL    *url.URL
+	username   string
+	password   string
+	http       *http.Client
+	routeGuard routeguard.Guard
 
 	mu     sync.Mutex
 	tokens map[string]string
@@ -81,15 +84,18 @@ func New(options Options) (*Client, error) {
 			// not leak Registry credentials to their target, even if the target
 			// happens to be on the same host.
 			request.Header.Del("Authorization")
+			request.Header.Del(routeguard.InstanceHeader)
+			request.Header.Del(routeguard.HopHeader)
 			return nil
 		},
 	}
 	return &Client{
-		baseURL:  baseURL,
-		username: options.Username,
-		password: options.Password,
-		http:     client,
-		tokens:   make(map[string]string),
+		baseURL:    baseURL,
+		username:   options.Username,
+		password:   options.Password,
+		http:       client,
+		routeGuard: options.RouteGuard,
+		tokens:     make(map[string]string),
 	}, nil
 }
 
@@ -252,13 +258,9 @@ func validateBlobResponseDigest(response *http.Response, requested string) (stri
 }
 
 func (client *Client) request(ctx context.Context, method string, endpoint *url.URL, scope string, mutate func(*http.Request)) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), nil)
+	request, err := client.newRequest(ctx, method, endpoint, mutate)
 	if err != nil {
 		return nil, err
-	}
-	request.Header.Set("Accept-Encoding", "identity")
-	if mutate != nil {
-		mutate(request)
 	}
 	if token := client.token(scope); token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
@@ -276,13 +278,9 @@ func (client *Client) request(ctx context.Context, method string, endpoint *url.
 	if err != nil {
 		return nil, err
 	}
-	request, err = http.NewRequestWithContext(ctx, method, endpoint.String(), nil)
+	request, err = client.newRequest(ctx, method, endpoint, mutate)
 	if err != nil {
 		return nil, err
-	}
-	request.Header.Set("Accept-Encoding", "identity")
-	if mutate != nil {
-		mutate(request)
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	response, err = client.http.Do(request)
@@ -290,6 +288,21 @@ func (client *Client) request(ctx context.Context, method string, endpoint *url.
 		return nil, fmt.Errorf("retry Provider request: %w", err)
 	}
 	return response, nil
+}
+
+func (client *Client) newRequest(ctx context.Context, method string, endpoint *url.URL, mutate func(*http.Request)) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	if mutate != nil {
+		mutate(request)
+	}
+	if err := client.routeGuard.Outbound(ctx, request.Header); err != nil {
+		return nil, err
+	}
+	return request, nil
 }
 
 func (client *Client) obtainToken(ctx context.Context, challenge, scope string) (string, error) {

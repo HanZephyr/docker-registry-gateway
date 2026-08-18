@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hjx/docker-registry-gateway/internal/provider"
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
 func TestClientUsesBearerChallengeAndStreamsBlobRange(t *testing.T) {
@@ -110,6 +111,38 @@ func TestClientRejectsManifestWithMismatchedContentDigest(t *testing.T) {
 	}
 	if _, err := client.Manifest(context.Background(), "library/nginx", "latest", nil); err == nil {
 		t.Fatal("Manifest() error = nil, want mismatched content digest rejection")
+	}
+}
+
+func TestClientExtendsValidatedGatewayRouteOnProviderRequest(t *testing.T) {
+	manifest := []byte(`{"schemaVersion":2}`)
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if got, want := request.Header.Get(routeguard.InstanceHeader), "gateway-b, gateway-a"; got != want {
+			t.Errorf("%s = %q, want %q", routeguard.InstanceHeader, got, want)
+		}
+		if got, want := request.Header.Get(routeguard.HopHeader), "2"; got != want {
+			t.Errorf("%s = %q, want %q", routeguard.HopHeader, got, want)
+		}
+		response.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		response.Header().Set("Docker-Content-Digest", digest(manifest))
+		_, _ = response.Write(manifest)
+	}))
+	defer server.Close()
+
+	guard := routeguard.New("gateway-a", 3)
+	headers := make(http.Header)
+	headers.Set(routeguard.InstanceHeader, "gateway-b")
+	headers.Set(routeguard.HopHeader, "1")
+	ctx, err := guard.Inbound(context.Background(), headers)
+	if err != nil {
+		t.Fatalf("Inbound() error = %v", err)
+	}
+	client, err := provider.New(provider.Options{URL: server.URL, RouteGuard: guard})
+	if err != nil {
+		t.Fatalf("provider.New() error = %v", err)
+	}
+	if _, err := client.Manifest(ctx, "library/nginx", "latest", nil); err != nil {
+		t.Fatalf("Manifest() error = %v", err)
 	}
 }
 

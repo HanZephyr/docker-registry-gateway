@@ -31,6 +31,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/onboard"
 	"github.com/hjx/docker-registry-gateway/internal/provider"
 	"github.com/hjx/docker-registry-gateway/internal/registry"
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 	"github.com/hjx/docker-registry-gateway/internal/router"
 	"github.com/hjx/docker-registry-gateway/internal/trust"
 )
@@ -177,6 +178,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintf(errorOutput, "加载服务端证书失败: %v\n", err)
 		return 1
 	}
+	routeGuard := routeguard.New(tlsResult.InstanceID, 3)
 
 	tracker := router.NewHealth()
 	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now)
@@ -191,7 +193,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		return 1
 	}
 	tempBudget := router.NewTempBudget(temporaryDiskQuota)
-	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget)
+	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, routeGuard)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
@@ -201,7 +203,9 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		MaxQueuedPulls:     loaded.Resources.MaxQueuedPulls,
 	})
 	server := &http.Server{
-		Handler:   gateway.LimitRequests(registry.NewHandler(backend), loaded.Resources.MaxInflightRequests),
+		Handler: gateway.LimitRequests(registry.NewHandlerWithOptions(backend, registry.HandlerOptions{
+			RouteGuard: routeGuard,
+		}), loaded.Resources.MaxInflightRequests),
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12},
 	}
 
@@ -261,7 +265,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		probeGroup.Add(1)
 		go func() {
 			defer probeGroup.Done()
-			probeProviders(probeContext, configuration, probeOutput, events)
+			probeProviders(probeContext, configuration, probeOutput, events, routeGuard)
 		}()
 	}
 	defer func() {
@@ -300,7 +304,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget)
+			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, routeGuard)
 			if err != nil {
 				return err
 			}
@@ -360,7 +364,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	}
 }
 
-func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log) {
+func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log, routeGuard routeguard.Guard) {
 	for _, configured := range loaded.Providers {
 		if parent.Err() != nil {
 			return
@@ -370,10 +374,11 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 		if err == nil {
 			var client *provider.Client
 			client, err = provider.New(provider.Options{
-				URL:      configured.URL,
-				Username: username,
-				Password: password,
-				CAFile:   configured.CAFile,
+				URL:        configured.URL,
+				Username:   username,
+				Password:   password,
+				CAFile:     configured.CAFile,
+				RouteGuard: routeGuard,
 			})
 			if err == nil {
 				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
@@ -411,7 +416,7 @@ func (writer *lockedWriter) Write(contents []byte) (int, error) {
 	return writer.writer.Write(contents)
 }
 
-func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget) (*router.Router, error) {
+func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget, routeGuard routeguard.Guard) (*router.Router, error) {
 	sources := make([]router.Source, 0, len(loaded.Providers))
 	for _, configured := range loaded.Providers {
 		username, password, err := configured.Auth.Credentials()
@@ -419,10 +424,11 @@ func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, temp
 			return nil, fmt.Errorf("读取 Provider %q 凭据: %w", configured.Name, err)
 		}
 		client, err := provider.New(provider.Options{
-			URL:      configured.URL,
-			Username: username,
-			Password: password,
-			CAFile:   configured.CAFile,
+			URL:        configured.URL,
+			Username:   username,
+			Password:   password,
+			CAFile:     configured.CAFile,
+			RouteGuard: routeGuard,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("初始化 Provider %q: %w", configured.Name, err)

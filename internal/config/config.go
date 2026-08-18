@@ -268,6 +268,9 @@ func (value Config) Validate() error {
 	if err := validateProviders(value.Providers); err != nil {
 		return err
 	}
+	if err := validateProviderSelfRoutes(value.Server.TLS.AdvertiseEndpoint, value.Providers); err != nil {
+		return err
+	}
 	if err := validateResolution(value.Resolution, value.Providers); err != nil {
 		return err
 	}
@@ -307,24 +310,65 @@ func validateServer(server Server) error {
 	if len(server.Listeners) == 0 {
 		return errors.New("at least one listener is required")
 	}
+	type listenerEndpoint struct {
+		host string
+		port string
+	}
 	seen := make(map[string]struct{}, len(server.Listeners))
+	endpoints := make([]listenerEndpoint, 0, len(server.Listeners))
 	for _, listener := range server.Listeners {
 		listener = strings.TrimSpace(listener)
 		if listener == "" {
 			return errors.New("listener cannot be empty")
 		}
-		if _, _, err := net.SplitHostPort(listener); err != nil {
+		host, port, err := net.SplitHostPort(listener)
+		if err != nil {
 			return fmt.Errorf("invalid listener %q: %w", listener, err)
+		}
+		if host == "" || port == "" {
+			return fmt.Errorf("invalid listener %q", listener)
 		}
 		if _, exists := seen[listener]; exists {
 			return fmt.Errorf("duplicate listener %q", listener)
 		}
 		seen[listener] = struct{}{}
+		for _, previous := range endpoints {
+			if listenerEndpointsOverlap(previous.host, previous.port, host, port) {
+				return fmt.Errorf("listener %q overlaps %q", listener, net.JoinHostPort(previous.host, previous.port))
+			}
+		}
+		endpoints = append(endpoints, listenerEndpoint{host: host, port: port})
 	}
 	if _, _, err := net.SplitHostPort(strings.TrimSpace(server.TLS.AdvertiseEndpoint)); err != nil {
 		return fmt.Errorf("invalid advertise_endpoint %q: %w", server.TLS.AdvertiseEndpoint, err)
 	}
 	return nil
+}
+
+func listenerEndpointsOverlap(leftHost, leftPort, rightHost, rightPort string) bool {
+	if leftPort != rightPort {
+		return false
+	}
+	leftHost = strings.Trim(strings.ToLower(leftHost), "[]")
+	rightHost = strings.Trim(strings.ToLower(rightHost), "[]")
+	if leftHost == rightHost {
+		return true
+	}
+	leftIP := net.ParseIP(leftHost)
+	rightIP := net.ParseIP(rightHost)
+	if leftHost == "0.0.0.0" {
+		return rightIP == nil || rightIP.To4() != nil
+	}
+	if rightHost == "0.0.0.0" {
+		return leftIP == nil || leftIP.To4() != nil
+	}
+	if leftHost == "::" {
+		return rightIP == nil || rightIP.To4() == nil
+	}
+	if rightHost == "::" {
+		return leftIP == nil || leftIP.To4() == nil
+	}
+	return false
 }
 
 func validateProviders(providers []Provider) error {
@@ -365,6 +409,34 @@ func validateProviders(providers []Provider) error {
 	}
 	if !hasPullProvider {
 		return errors.New("at least one pull provider is required")
+	}
+	return nil
+}
+
+func validateProviderSelfRoutes(advertiseEndpoint string, providers []Provider) error {
+	advertiseHost, advertisePort, err := net.SplitHostPort(strings.TrimSpace(advertiseEndpoint))
+	if err != nil {
+		return err
+	}
+	advertiseHost = strings.Trim(strings.ToLower(advertiseHost), "[]")
+	for _, provider := range providers {
+		parsed, err := url.Parse(strings.TrimSpace(provider.URL))
+		if err != nil {
+			continue
+		}
+		providerHost := strings.Trim(strings.ToLower(parsed.Hostname()), "[]")
+		providerPort := parsed.Port()
+		if providerPort == "" {
+			switch strings.ToLower(parsed.Scheme) {
+			case "https":
+				providerPort = "443"
+			case "http":
+				providerPort = "80"
+			}
+		}
+		if providerHost == advertiseHost && providerPort == advertisePort {
+			return fmt.Errorf("provider %q points at Gateway advertise_endpoint %q", provider.Name, advertiseEndpoint)
+		}
 	}
 	return nil
 }

@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
 var (
@@ -52,11 +54,30 @@ func NewHandler(backend Backend) http.Handler {
 	return handler{backend: backend}
 }
 
+// HandlerOptions configures optional protections around the intentionally
+// small downstream Registry pull surface.
+type HandlerOptions struct {
+	RouteGuard routeguard.Guard
+}
+
+// NewHandlerWithOptions creates the HTTP pull API with Gateway-to-Gateway
+// routing protection enabled when RouteGuard has an instance identity.
+func NewHandlerWithOptions(backend Backend, options HandlerOptions) http.Handler {
+	return handler{backend: backend, routeGuard: options.RouteGuard}
+}
+
 type handler struct {
-	backend Backend
+	backend    Backend
+	routeGuard routeguard.Guard
 }
 
 func (value handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	context, err := value.routeGuard.Inbound(request.Context(), request.Header)
+	if err != nil {
+		writeOCIError(response, http.StatusServiceUnavailable, "UNAVAILABLE", "gateway routing loop detected")
+		return
+	}
+	request = request.WithContext(context)
 	if request.URL.Path == "/v2" || request.URL.Path == "/v2/" {
 		value.servePing(response, request)
 		return

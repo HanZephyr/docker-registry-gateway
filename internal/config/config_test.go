@@ -237,3 +237,45 @@ resolution:
 		t.Errorf("config.Load() error = %q, want missing resolver detail", err)
 	}
 }
+
+func TestLoadRejectsProviderThatPointsAtTheGatewayEndpoint(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: true
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: loop
+    url: https://drg.localhost:5443
+    resolver: true
+    pull_provider: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "points at Gateway") {
+		t.Fatalf("config.Load() error = %v, want self-route rejection", err)
+	}
+}
+
+func TestLoadRejectsOverlappingListeners(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [0.0.0.0:5443, 127.0.0.1:5443]
+  tls:
+    local_ca: true
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("config.Load() error = %v, want listener overlap rejection", err)
+	}
+}

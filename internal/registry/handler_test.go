@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
 func TestHandlerServesV2ManifestAndRangedBlob(t *testing.T) {
@@ -105,10 +106,42 @@ func TestHandlerAbortsFullBlobResponseWhenDigestDoesNotMatch(t *testing.T) {
 	handler.ServeHTTP(response, request)
 }
 
+func TestHandlerRejectsGatewayRouteThatReturnsToThisInstance(t *testing.T) {
+	backend := &countingBackend{}
+	handler := registry.NewHandlerWithOptions(backend, registry.HandlerOptions{
+		RouteGuard: routeguard.New("gateway-a", 3),
+	})
+	request := httptest.NewRequest(http.MethodGet, "https://drg.localhost:5443/v2/library/nginx/manifests/latest", nil)
+	request.Header.Set(routeguard.InstanceHeader, "gateway-a")
+	request.Header.Set(routeguard.HopHeader, "1")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusServiceUnavailable; got != want {
+		t.Fatalf("status = %d, want %d; body = %s", got, want, response.Body.String())
+	}
+	if backend.calls != 0 {
+		t.Errorf("backend calls = %d, want no routing after loop rejection", backend.calls)
+	}
+}
+
 type fakeBackend struct {
 	manifest   registry.Manifest
 	blob       []byte
 	blobDigest string
+}
+
+type countingBackend struct{ calls int }
+
+func (backend *countingBackend) Manifest(_ context.Context, _, _ string, _ []string) (registry.Manifest, error) {
+	backend.calls++
+	return registry.Manifest{}, registry.ErrUnavailable
+}
+
+func (backend *countingBackend) Blob(_ context.Context, _, _, _ string) (registry.Blob, error) {
+	backend.calls++
+	return registry.Blob{}, registry.ErrUnavailable
 }
 
 func (backend fakeBackend) Manifest(_ context.Context, repository, reference string, _ []string) (registry.Manifest, error) {

@@ -28,6 +28,9 @@ func TestReconcileCreatesTrustedLeafForConfiguredAndDesktopNames(t *testing.T) {
 	if !result.RootCreated || !result.LeafIssued {
 		t.Errorf("result = %+v, want newly created root and leaf", result)
 	}
+	if result.InstanceID == "" {
+		t.Error("result InstanceID is empty, want stable Gateway identity derived from the root CA")
+	}
 
 	root := readCertificate(t, filepath.Join(dataDir, "pki", "ca.crt"))
 	leaf := readCertificate(t, filepath.Join(dataDir, "pki", "server.crt"))

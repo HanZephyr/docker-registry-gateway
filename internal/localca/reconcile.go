@@ -47,6 +47,7 @@ type Options struct {
 type Result struct {
 	RootCreated  bool
 	LeafIssued   bool
+	InstanceID   string
 	CAPath       string
 	Certificate  string
 	PrivateKey   string
@@ -93,6 +94,7 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	result.RootCreated = rootCreated
+	result.InstanceID = fingerprint(rootCertificate)
 
 	leaf, leafKey, err := loadLeaf(result.Certificate, result.PrivateKey)
 	if err != nil || leafNeedsRenewal(leaf, rootCertificate, host, now) {
@@ -270,8 +272,7 @@ func loadLeaf(certificatePath, keyPath string) (*x509.Certificate, *ecdsa.Privat
 }
 
 func writeIdentity(path string, certificate *x509.Certificate) error {
-	fingerprint := sha256.Sum256(certificate.Raw)
-	contents, err := json.Marshal(identity{RootFingerprintSHA256: "sha256:" + hex.EncodeToString(fingerprint[:])})
+	contents, err := json.Marshal(identity{RootFingerprintSHA256: fingerprint(certificate)})
 	if err != nil {
 		return fmt.Errorf("encode local CA identity: %w", err)
 	}
@@ -287,12 +288,16 @@ func verifyIdentity(path string, certificate *x509.Certificate) error {
 	if err := json.Unmarshal(contents, &stored); err != nil {
 		return fmt.Errorf("decode local CA identity: %w", err)
 	}
-	fingerprint := sha256.Sum256(certificate.Raw)
-	want := "sha256:" + hex.EncodeToString(fingerprint[:])
+	want := fingerprint(certificate)
 	if stored.RootFingerprintSHA256 != want {
 		return errors.New("local CA fingerprint does not match the Gateway identity")
 	}
 	return nil
+}
+
+func fingerprint(certificate *x509.Certificate) string {
+	sum := sha256.Sum256(certificate.Raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func writeCertificate(path string, certificate *x509.Certificate) error {
