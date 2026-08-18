@@ -21,6 +21,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
 	"github.com/hjx/docker-registry-gateway/internal/gateway"
+	"github.com/hjx/docker-registry-gateway/internal/healthhistory"
 	"github.com/hjx/docker-registry-gateway/internal/lease"
 	"github.com/hjx/docker-registry-gateway/internal/localca"
 	"github.com/hjx/docker-registry-gateway/internal/onboard"
@@ -168,7 +169,14 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		return 1
 	}
 
-	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath))
+	tracker := router.NewHealth()
+	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now)
+	if snapshots, loadErr := healthStore.Load(healthhistory.Retention); loadErr != nil {
+		fmt.Fprintf(errorOutput, "读取 Provider 健康历史失败，将以空历史启动: %v\n", loadErr)
+	} else {
+		tracker.Restore(snapshots)
+	}
+	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
@@ -198,6 +206,32 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	var probeGroup sync.WaitGroup
 	probesStopping := false
 	probeOutput := &lockedWriter{writer: output}
+	persistHealth := func() {
+		if err := healthStore.Save(tracker.Snapshot()); err != nil {
+			fmt.Fprintf(probeOutput, "保存 Provider 健康历史失败: %v\n", err)
+		}
+	}
+	healthStopping := make(chan struct{})
+	var healthGroup sync.WaitGroup
+	healthGroup.Add(1)
+	go func() {
+		defer healthGroup.Done()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-healthStopping:
+				return
+			case <-ticker.C:
+				persistHealth()
+			}
+		}
+	}()
+	defer func() {
+		close(healthStopping)
+		healthGroup.Wait()
+		persistHealth()
+	}()
 	launchProbe := func(configuration config.Config) {
 		probeMu.Lock()
 		defer probeMu.Unlock()
@@ -220,7 +254,12 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	var reloadMu sync.Mutex
 	localControl, err := control.Start(loaded.DataDir, control.Callbacks{
 		Status: func() control.Status {
-			return control.Status{State: "running", Listeners: append([]string(nil), listenersForStatus...), ActivePulls: backend.ActivePulls()}
+			return control.Status{
+				State:       "running",
+				Listeners:   append([]string(nil), listenersForStatus...),
+				ActivePulls: backend.ActivePulls(),
+				Providers:   providerHealthStatuses(tracker.Snapshot()),
+			}
 		},
 		Reload: func(_ context.Context) error {
 			reloadMu.Lock()
@@ -240,7 +279,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			replacement, err := buildRouter(candidate, []byte(absConfigPath))
+			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker)
 			if err != nil {
 				return err
 			}
@@ -350,7 +389,7 @@ func (writer *lockedWriter) Write(contents []byte) (int, error) {
 	return writer.writer.Write(contents)
 }
 
-func buildRouter(loaded config.Config, salt []byte) (*router.Router, error) {
+func buildRouter(loaded config.Config, salt []byte, tracker *router.Health) (*router.Router, error) {
 	sources := make([]router.Source, 0, len(loaded.Providers))
 	for _, configured := range loaded.Providers {
 		username, password, err := configured.Auth.Credentials()
@@ -397,6 +436,7 @@ func buildRouter(loaded config.Config, salt []byte) (*router.Router, error) {
 		MaxNoRangeRestartDiscard: maxNoRangeRestartDiscard,
 		DecisionLease:            decisionLease,
 		LeaseStore:               leaseStore,
+		Health:                   tracker,
 	}), nil
 }
 
@@ -462,7 +502,37 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 		return 1
 	}
 	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, strings.Join(status.Listeners, ", "))
+	for _, provider := range status.Providers {
+		fmt.Fprintf(output, "Provider %s：近期吞吐 %.2f MiB/s；本进程失败 %d；最近成功 %s；最近失败 %s\n",
+			provider.Name,
+			provider.ThroughputBytesPerSecond/(1<<20),
+			provider.Failures,
+			formatHealthTime(provider.LastSuccess),
+			formatHealthTime(provider.LastFailure),
+		)
+	}
 	return 0
+}
+
+func providerHealthStatuses(snapshots []router.HealthSnapshot) []control.ProviderHealth {
+	result := make([]control.ProviderHealth, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		result = append(result, control.ProviderHealth{
+			Name:                     snapshot.Provider,
+			ThroughputBytesPerSecond: snapshot.ThroughputBytesPerSecond,
+			Failures:                 snapshot.Failures,
+			LastSuccess:              snapshot.LastSuccess,
+			LastFailure:              snapshot.LastFailure,
+		})
+	}
+	return result
+}
+
+func formatHealthTime(value time.Time) string {
+	if value.IsZero() {
+		return "无"
+	}
+	return value.Local().Format(time.RFC3339)
 }
 
 func runStart(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {

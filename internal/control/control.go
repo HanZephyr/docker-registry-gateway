@@ -23,10 +23,20 @@ const infoFileName = "control.json"
 
 // Status is the intentionally compact view exposed to the local CLI.
 type Status struct {
-	State       string   `json:"state"`
-	PID         int      `json:"pid"`
-	Listeners   []string `json:"listeners,omitempty"`
-	ActivePulls int      `json:"active_pulls"`
+	State       string           `json:"state"`
+	PID         int              `json:"pid"`
+	Listeners   []string         `json:"listeners,omitempty"`
+	ActivePulls int              `json:"active_pulls"`
+	Providers   []ProviderHealth `json:"providers,omitempty"`
+}
+
+// ProviderHealth is the non-secret, local diagnostic view of one Provider.
+type ProviderHealth struct {
+	Name                     string    `json:"name"`
+	ThroughputBytesPerSecond float64   `json:"throughput_bytes_per_second"`
+	Failures                 int       `json:"failures"`
+	LastSuccess              time.Time `json:"last_success,omitempty"`
+	LastFailure              time.Time `json:"last_failure,omitempty"`
 }
 
 // Callbacks bind command handling to a running Gateway instance.
