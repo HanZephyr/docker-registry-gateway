@@ -346,6 +346,10 @@ func runProviderAdd(ctx context.Context, arguments []string, output, errorOutput
 	}
 	candidate := loaded
 	candidate.Providers = append(append([]config.Provider(nil), loaded.Providers...), provider)
+	if err := candidate.Validate(); err != nil {
+		fmt.Fprintf(errorOutput, "Provider 配置无效，未进行准入探测: %v\n", err)
+		return 2
+	}
 	probeResult, err := probeProviderAdmission(ctx, provider, candidate.ProbeRef, candidate.AllowNonRangeProviders)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "Provider %s 准入探测失败，未写入配置: %v\n", provider.Name, err)
@@ -432,6 +436,10 @@ func loadConfigAtPath(path string, errorOutput io.Writer) (config.Config, string
 }
 
 func applyProviderConfiguration(ctx context.Context, configPath string, candidate config.Config, message string, output, errorOutput io.Writer) int {
+	if err := candidate.Validate(); err != nil {
+		fmt.Fprintf(errorOutput, "Provider 配置无效，未写入配置: %v\n", err)
+		return 2
+	}
 	backupPath, original, err := writeConfigurationWithBackup(configPath, candidate)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "保存 Provider 配置失败: %v\n", err)

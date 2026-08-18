@@ -493,6 +493,18 @@ providers:
 	}
 	output.Reset()
 	errors.Reset()
+	duplicate := []string{"provider", "add", "--config", configPath, "--name", "docker_hub", "--url", "http://127.0.0.1:1", "--pull-provider", "--allow-insecure-http"}
+	if exitCode := cli.Run(context.Background(), duplicate, strings.NewReader(""), &output, &errors); exitCode == 0 {
+		t.Fatal("provider add unexpectedly accepted a duplicate provider name")
+	}
+	if !strings.Contains(errors.String(), "duplicate provider name") {
+		t.Errorf("duplicate provider stderr = %q, want static validation error", errors.String())
+	}
+	if currentContents, readErr := os.ReadFile(configPath); readErr != nil || string(currentContents) != string(originalContents) {
+		t.Errorf("configuration changed after static validation failure: readErr=%v", readErr)
+	}
+	output.Reset()
+	errors.Reset()
 	probeContents := []byte("probe")
 	probeSum := sha256.Sum256(probeContents)
 	probeDigest := fmt.Sprintf("sha256:%x", probeSum[:])
