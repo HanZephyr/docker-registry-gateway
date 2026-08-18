@@ -11,12 +11,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/hjx/docker-registry-gateway/internal/config"
 )
 
 // Answers contains the deployment choices collected by drg onboard.
 type Answers struct {
 	Listeners         []string
 	AdvertiseEndpoint string
+	Providers         []config.Provider
+	Resources         config.Resources
 }
 
 // Options controls an onboarding run.
@@ -58,7 +62,10 @@ func Run(ctx context.Context, options Options) error {
 		}
 	}
 
-	contents := defaultConfiguration(advertiseEndpoint, listeners)
+	contents := defaultConfiguration(advertiseEndpoint, listeners, options.Answers.Providers, options.Answers.Resources)
+	if _, err := config.Load(strings.NewReader(contents)); err != nil {
+		return fmt.Errorf("validate generated configuration: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
 		return fmt.Errorf("create configuration directory: %w", err)
 	}
@@ -87,7 +94,7 @@ func Run(ctx context.Context, options Options) error {
 	return nil
 }
 
-func defaultConfiguration(advertiseEndpoint string, listeners []string) string {
+func defaultConfiguration(advertiseEndpoint string, listeners []string, additionalProviders []config.Provider, resources config.Resources) string {
 	var builder strings.Builder
 	builder.WriteString("# Docker Registry Gateway configuration\n")
 	builder.WriteString("version: 1\n\n")
@@ -109,22 +116,81 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string) string {
 	builder.WriteString("  - name: docker_hub\n")
 	builder.WriteString("    url: https://registry-1.docker.io\n")
 	builder.WriteString("    resolver: true\n")
-	builder.WriteString("    pull_provider: true\n\n")
+	builder.WriteString("    pull_provider: true\n")
+	for _, provider := range additionalProviders {
+		builder.WriteString("  - name: ")
+		builder.WriteString(yamlScalar(provider.Name))
+		builder.WriteString("\n    url: ")
+		builder.WriteString(yamlScalar(provider.URL))
+		builder.WriteString("\n    resolver: ")
+		builder.WriteString(fmt.Sprintf("%t", provider.Resolver))
+		builder.WriteString("\n    pull_provider: ")
+		builder.WriteString(fmt.Sprintf("%t", provider.PullProvider))
+		if provider.Priority != nil {
+			builder.WriteString(fmt.Sprintf("\n    priority: %d", *provider.Priority))
+		}
+		if provider.Auth.Username != "" {
+			builder.WriteString("\n    auth:\n      username: ")
+			builder.WriteString(yamlScalar(provider.Auth.Username))
+			if provider.Auth.SecretFile != "" {
+				builder.WriteString("\n      secret_file: ")
+				builder.WriteString(yamlScalar(provider.Auth.SecretFile))
+			} else if provider.Auth.Password != "" {
+				builder.WriteString("\n      password: ")
+				builder.WriteString(yamlScalar(provider.Auth.Password))
+			}
+		}
+		if provider.CAFile != "" {
+			builder.WriteString("\n    ca_file: ")
+			builder.WriteString(yamlScalar(provider.CAFile))
+		}
+		if provider.AllowInsecureHTTP {
+			builder.WriteString("\n    allow_insecure_http: true")
+		}
+		builder.WriteByte('\n')
+	}
+	builder.WriteByte('\n')
 	builder.WriteString("resolution:\n")
 	builder.WriteString("  conflict_strategy: majority\n")
 	builder.WriteString("  tie_breaker: rendezvous_hash\n")
 	builder.WriteString("  decision_lease: 10m\n\n")
 	builder.WriteString("probe_ref: library/busybox:latest\n")
 	builder.WriteString("allow_non_range_providers: true\n")
+	resources = normalizedResources(resources)
 	builder.WriteString("\nresources:\n")
-	builder.WriteString("  max_concurrent_pulls: 4\n")
-	builder.WriteString("  max_segments_per_blob: 4\n")
-	builder.WriteString("  temporary_disk_quota: 2GiB\n")
-	builder.WriteString("  min_segment_size: 16MiB\n")
-	builder.WriteString("  max_no_range_restart_discard: 64MiB\n")
-	builder.WriteString("  max_inflight_requests: 32\n")
-	builder.WriteString("  max_queued_pulls: 16\n")
+	builder.WriteString(fmt.Sprintf("  max_concurrent_pulls: %d\n", resources.MaxConcurrentPulls))
+	builder.WriteString(fmt.Sprintf("  max_segments_per_blob: %d\n", resources.MaxSegmentsPerBlob))
+	builder.WriteString("  temporary_disk_quota: " + yamlScalar(resources.TemporaryDiskQuota) + "\n")
+	builder.WriteString("  min_segment_size: " + yamlScalar(resources.MinSegmentSize) + "\n")
+	builder.WriteString("  max_no_range_restart_discard: " + yamlScalar(resources.MaxNoRangeRestartDiscard) + "\n")
+	builder.WriteString(fmt.Sprintf("  max_inflight_requests: %d\n", resources.MaxInflightRequests))
+	builder.WriteString(fmt.Sprintf("  max_queued_pulls: %d\n", resources.MaxQueuedPulls))
 	return builder.String()
+}
+
+func normalizedResources(resources config.Resources) config.Resources {
+	if resources.MaxConcurrentPulls == 0 {
+		resources.MaxConcurrentPulls = 4
+	}
+	if resources.MaxSegmentsPerBlob == 0 {
+		resources.MaxSegmentsPerBlob = 4
+	}
+	if resources.TemporaryDiskQuota == "" {
+		resources.TemporaryDiskQuota = "2GiB"
+	}
+	if resources.MinSegmentSize == "" {
+		resources.MinSegmentSize = "16MiB"
+	}
+	if resources.MaxNoRangeRestartDiscard == "" {
+		resources.MaxNoRangeRestartDiscard = "64MiB"
+	}
+	if resources.MaxInflightRequests == 0 {
+		resources.MaxInflightRequests = 32
+	}
+	if resources.MaxQueuedPulls == 0 {
+		resources.MaxQueuedPulls = 16
+	}
+	return resources
 }
 
 func yamlScalar(value string) string {

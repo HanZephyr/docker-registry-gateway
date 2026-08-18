@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/onboard"
 )
 
@@ -42,6 +43,30 @@ func TestRunCreatesANewValidDefaultConfiguration(t *testing.T) {
 	} {
 		if !strings.Contains(string(contents), expected) {
 			t.Errorf("generated configuration does not contain %q:\n%s", expected, contents)
+		}
+	}
+}
+
+func TestRunIncludesChosenProviderAndResourceLimits(t *testing.T) {
+	t.Parallel()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	if err := onboard.Run(context.Background(), onboard.Options{
+		ConfigPath: configPath,
+		Answers: onboard.Answers{
+			AdvertiseEndpoint: "drg.localhost:5443",
+			Providers:         []config.Provider{{Name: "mirror", URL: "https://mirror.example.test", PullProvider: true}},
+			Resources:         config.Resources{MaxConcurrentPulls: 2, MaxSegmentsPerBlob: 3, TemporaryDiskQuota: "1GiB", MinSegmentSize: "8MiB", MaxNoRangeRestartDiscard: "32MiB", MaxInflightRequests: 12, MaxQueuedPulls: 6},
+		},
+	}); err != nil {
+		t.Fatalf("onboard.Run() error = %v", err)
+	}
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated configuration: %v", err)
+	}
+	for _, expected := range []string{"name: mirror", "url: https://mirror.example.test", "max_concurrent_pulls: 2", "temporary_disk_quota: 1GiB"} {
+		if !strings.Contains(string(contents), expected) {
+			t.Errorf("generated configuration lacks %q:\n%s", expected, contents)
 		}
 	}
 }

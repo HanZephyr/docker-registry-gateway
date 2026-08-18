@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -851,10 +852,22 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 		fmt.Fprintf(errorOutput, "读取访问地址: %v\n", err)
 		return 1
 	}
+	providers, err := promptAdditionalProviders(reader, output)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取 Provider 配置: %v\n", err)
+		return 1
+	}
+	resources, err := promptResources(reader, output)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取资源上限: %v\n", err)
+		return 1
+	}
 
 	answers := onboard.Answers{
 		Listeners:         splitListeners(listeners),
 		AdvertiseEndpoint: advertiseEndpoint,
+		Providers:         providers,
+		Resources:         resources,
 	}
 	if err := onboard.Run(ctx, onboard.Options{ConfigPath: *configPath, Answers: answers}); err != nil {
 		fmt.Fprintf(errorOutput, "创建配置失败: %v\n", err)
@@ -901,6 +914,117 @@ func splitListeners(value string) []string {
 		listeners = append(listeners, strings.TrimSpace(part))
 	}
 	return listeners
+}
+
+func promptAdditionalProviders(reader *bufio.Reader, output io.Writer) ([]config.Provider, error) {
+	add, err := promptYesNo(reader, output, "是否添加第三方 Provider", false)
+	if err != nil || !add {
+		return nil, err
+	}
+	var providers []config.Provider
+	for index := 1; ; index++ {
+		name, err := prompt(reader, output, fmt.Sprintf("Provider %d 名称", index), "")
+		if err != nil || strings.TrimSpace(name) == "" {
+			return nil, errors.New("Provider 名称不能为空")
+		}
+		endpoint, err := prompt(reader, output, fmt.Sprintf("Provider %d URL", index), "")
+		if err != nil || strings.TrimSpace(endpoint) == "" {
+			return nil, errors.New("Provider URL 不能为空")
+		}
+		resolver, err := promptYesNo(reader, output, "作为 Resolver", false)
+		if err != nil {
+			return nil, err
+		}
+		pullProvider, err := promptYesNo(reader, output, "作为 Pull Provider", true)
+		if err != nil {
+			return nil, err
+		}
+		username, err := prompt(reader, output, "上游用户名（留空代表匿名）", "")
+		if err != nil {
+			return nil, err
+		}
+		provider := config.Provider{Name: name, URL: endpoint, Resolver: resolver, PullProvider: pullProvider}
+		if strings.TrimSpace(username) != "" {
+			secretFile, promptErr := prompt(reader, output, "上游 secret_file 路径（单行密码或 PAT）", "")
+			if promptErr != nil || strings.TrimSpace(secretFile) == "" {
+				return nil, errors.New("配置用户名时 secret_file 不能为空")
+			}
+			provider.Auth = config.Auth{Username: username, SecretFile: secretFile}
+		}
+		providers = append(providers, provider)
+		more, promptErr := promptYesNo(reader, output, "继续添加 Provider", false)
+		if promptErr != nil || !more {
+			return providers, promptErr
+		}
+	}
+}
+
+func promptResources(reader *bufio.Reader, output io.Writer) (config.Resources, error) {
+	adjust, err := promptYesNo(reader, output, "是否调整资源上限", false)
+	if err != nil || !adjust {
+		return config.Resources{}, err
+	}
+	values := []struct {
+		label, fallback string
+		target          *string
+	}{
+		{"并发拉取数", "4", nil}, {"每层最大分片数", "4", nil}, {"临时磁盘配额", "2GiB", nil},
+		{"最小分片大小", "16MiB", nil}, {"无 Range 重拉丢弃上限", "64MiB", nil}, {"最大在途请求数", "32", nil}, {"最大排队拉取数", "16", nil},
+	}
+	answers := make([]string, len(values))
+	for index := range values {
+		value, promptErr := prompt(reader, output, values[index].label, values[index].fallback)
+		if promptErr != nil {
+			return config.Resources{}, promptErr
+		}
+		answers[index] = value
+	}
+	parseInt := func(value string) (int, error) {
+		parsed, parseErr := strconv.Atoi(value)
+		if parseErr != nil || parsed <= 0 {
+			return 0, fmt.Errorf("必须是正整数，得到 %q", value)
+		}
+		return parsed, nil
+	}
+	concurrent, err := parseInt(answers[0])
+	if err != nil {
+		return config.Resources{}, err
+	}
+	segments, err := parseInt(answers[1])
+	if err != nil {
+		return config.Resources{}, err
+	}
+	inflight, err := parseInt(answers[5])
+	if err != nil {
+		return config.Resources{}, err
+	}
+	queued, err := parseInt(answers[6])
+	if err != nil {
+		return config.Resources{}, err
+	}
+	return config.Resources{MaxConcurrentPulls: concurrent, MaxSegmentsPerBlob: segments, TemporaryDiskQuota: answers[2], MinSegmentSize: answers[3], MaxNoRangeRestartDiscard: answers[4], MaxInflightRequests: inflight, MaxQueuedPulls: queued}, nil
+}
+
+func promptYesNo(reader *bufio.Reader, output io.Writer, label string, defaultValue bool) (bool, error) {
+	defaultText := "y/N"
+	if defaultValue {
+		defaultText = "Y/n"
+	}
+	value, err := prompt(reader, output, label, defaultText)
+	if err != nil {
+		return false, err
+	}
+	if value == defaultText {
+		return defaultValue, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "y", "yes", "是", "true", "1":
+		return true, nil
+	case "n", "no", "否", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("请输入 y 或 n，得到 %q", value)
+	}
 }
 
 func printUsage(output io.Writer) {
