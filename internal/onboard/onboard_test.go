@@ -71,6 +71,38 @@ func TestRunIncludesChosenProviderAndResourceLimits(t *testing.T) {
 	}
 }
 
+func TestRunCanGenerateExternalTLSConfiguration(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(configPath), "gateway.crt"), []byte("certificate"), 0o600); err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(configPath), "gateway.key"), []byte("key"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	if err := onboard.Run(context.Background(), onboard.Options{
+		ConfigPath: configPath,
+		Answers: onboard.Answers{
+			AdvertiseEndpoint: "drg.example.test:5443",
+			TLSMode:           "external",
+			CertificateFile:   "gateway.crt",
+			PrivateKeyFile:    "gateway.key",
+		},
+	}); err != nil {
+		t.Fatalf("onboard.Run() external TLS error = %v", err)
+	}
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read generated configuration: %v", err)
+	}
+	for _, expected := range []string{"local_ca: false", "cert_file: gateway.crt", "key_file: gateway.key"} {
+		if !strings.Contains(string(contents), expected) {
+			t.Errorf("external TLS configuration lacks %q:\n%s", expected, contents)
+		}
+	}
+}
+
 func TestRunRefusesToOverwriteExistingConfiguration(t *testing.T) {
 	t.Parallel()
 

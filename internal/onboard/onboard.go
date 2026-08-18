@@ -19,6 +19,9 @@ import (
 type Answers struct {
 	Listeners         []string
 	AdvertiseEndpoint string
+	TLSMode           string
+	CertificateFile   string
+	PrivateKeyFile    string
 	Providers         []config.Provider
 	Resources         config.Resources
 }
@@ -62,7 +65,10 @@ func Run(ctx context.Context, options Options) error {
 		}
 	}
 
-	contents := defaultConfiguration(advertiseEndpoint, listeners, options.Answers.Providers, options.Answers.Resources)
+	contents, err := defaultConfiguration(advertiseEndpoint, listeners, options.Answers)
+	if err != nil {
+		return err
+	}
 	if _, err := config.Load(strings.NewReader(contents)); err != nil {
 		return fmt.Errorf("validate generated configuration: %w", err)
 	}
@@ -88,13 +94,23 @@ func Run(ctx context.Context, options Options) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close temporary configuration: %w", err)
 	}
+	if _, err := config.LoadFile(temporaryPath); err != nil {
+		return fmt.Errorf("validate generated configuration files: %w", err)
+	}
 	if err := os.Rename(temporaryPath, configPath); err != nil {
 		return fmt.Errorf("activate configuration: %w", err)
 	}
 	return nil
 }
 
-func defaultConfiguration(advertiseEndpoint string, listeners []string, additionalProviders []config.Provider, resources config.Resources) string {
+func defaultConfiguration(advertiseEndpoint string, listeners []string, answers Answers) (string, error) {
+	tlsMode := strings.TrimSpace(answers.TLSMode)
+	if tlsMode == "" {
+		tlsMode = "local_ca"
+	}
+	if tlsMode != "local_ca" && tlsMode != "external" && tlsMode != "http" {
+		return "", fmt.Errorf("unsupported TLS mode %q", tlsMode)
+	}
 	var builder strings.Builder
 	builder.WriteString("# Docker Registry Gateway configuration\n")
 	builder.WriteString("version: 1\n\n")
@@ -107,17 +123,31 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string, addition
 		builder.WriteByte('\n')
 	}
 	builder.WriteString("  tls:\n")
-	builder.WriteString("    local_ca: true\n")
-	builder.WriteString("    install_trust: true\n")
+	if tlsMode == "local_ca" {
+		builder.WriteString("    local_ca: true\n")
+		builder.WriteString("    install_trust: true\n")
+	} else {
+		builder.WriteString("    local_ca: false\n")
+		builder.WriteString("    install_trust: false\n")
+	}
 	builder.WriteString("    advertise_endpoint: ")
 	builder.WriteString(yamlScalar(advertiseEndpoint))
+	if tlsMode == "external" {
+		if strings.TrimSpace(answers.CertificateFile) == "" || strings.TrimSpace(answers.PrivateKeyFile) == "" {
+			return "", errors.New("external TLS mode requires certificate and private key files")
+		}
+		builder.WriteString("\n    cert_file: ")
+		builder.WriteString(yamlScalar(answers.CertificateFile))
+		builder.WriteString("\n    key_file: ")
+		builder.WriteString(yamlScalar(answers.PrivateKeyFile))
+	}
 	builder.WriteString("\n\n")
 	builder.WriteString("providers:\n")
 	builder.WriteString("  - name: docker_hub\n")
 	builder.WriteString("    url: https://registry-1.docker.io\n")
 	builder.WriteString("    resolver: true\n")
 	builder.WriteString("    pull_provider: true\n")
-	for _, provider := range additionalProviders {
+	for _, provider := range answers.Providers {
 		builder.WriteString("  - name: ")
 		builder.WriteString(yamlScalar(provider.Name))
 		builder.WriteString("\n    url: ")
@@ -156,7 +186,7 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string, addition
 	builder.WriteString("  decision_lease: 10m\n\n")
 	builder.WriteString("probe_ref: library/busybox:latest\n")
 	builder.WriteString("allow_non_range_providers: true\n")
-	resources = normalizedResources(resources)
+	resources := normalizedResources(answers.Resources)
 	builder.WriteString("\nresources:\n")
 	builder.WriteString(fmt.Sprintf("  max_concurrent_pulls: %d\n", resources.MaxConcurrentPulls))
 	builder.WriteString(fmt.Sprintf("  max_segments_per_blob: %d\n", resources.MaxSegmentsPerBlob))
@@ -169,7 +199,7 @@ func defaultConfiguration(advertiseEndpoint string, listeners []string, addition
 	builder.WriteString("  event_retention: 168h\n")
 	builder.WriteString("  event_max_bytes: 100MiB\n")
 	builder.WriteString("  health_retention: 168h\n")
-	return builder.String()
+	return builder.String(), nil
 }
 
 func normalizedResources(resources config.Resources) config.Resources {

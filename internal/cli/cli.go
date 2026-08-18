@@ -1631,6 +1631,29 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 		fmt.Fprintf(errorOutput, "读取访问地址: %v\n", err)
 		return 1
 	}
+	tlsMode, err := prompt(reader, output, "TLS 模式（local_ca/external/http）", "local_ca")
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取 TLS 模式: %v\n", err)
+		return 1
+	}
+	tlsMode = strings.ToLower(strings.TrimSpace(tlsMode))
+	if tlsMode != "local_ca" && tlsMode != "external" && tlsMode != "http" {
+		fmt.Fprintln(errorOutput, "TLS 模式只能是 local_ca、external 或 http")
+		return 2
+	}
+	certificateFile, privateKeyFile := "", ""
+	if tlsMode == "external" {
+		certificateFile, err = prompt(reader, output, "外部证书 cert_file 路径", "")
+		if err != nil || strings.TrimSpace(certificateFile) == "" {
+			fmt.Fprintln(errorOutput, "external TLS 必须提供 cert_file")
+			return 2
+		}
+		privateKeyFile, err = prompt(reader, output, "外部私钥 key_file 路径", "")
+		if err != nil || strings.TrimSpace(privateKeyFile) == "" {
+			fmt.Fprintln(errorOutput, "external TLS 必须提供 key_file")
+			return 2
+		}
+	}
 	providers, err := promptAdditionalProviders(reader, output)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "读取 Provider 配置: %v\n", err)
@@ -1645,6 +1668,9 @@ func runOnboard(ctx context.Context, arguments []string, input io.Reader, output
 	answers := onboard.Answers{
 		Listeners:         splitListeners(listeners),
 		AdvertiseEndpoint: advertiseEndpoint,
+		TLSMode:           tlsMode,
+		CertificateFile:   certificateFile,
+		PrivateKeyFile:    privateKeyFile,
 		Providers:         providers,
 		Resources:         resources,
 	}
