@@ -1,0 +1,12 @@
+version: 1
+data_dir: /tmp/drg
+server:
+  listeners: [0.0.0.0:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true

@@ -2,11 +2,11 @@
 FROM golang:1.26.5-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor ./vendor
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/drg ./cmd/drg
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/drg ./cmd/drg
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates && addgroup -S drg && adduser -S -G drg drg
