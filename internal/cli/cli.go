@@ -1070,16 +1070,59 @@ func runStop(ctx context.Context, arguments []string, output, errorOutput io.Wri
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
 		return 1
 	}
+	statusContext, cancel := context.WithTimeout(ctx, time.Second)
+	status, statusErr := control.StatusRequest(statusContext, loaded.DataDir)
+	cancel()
+	if statusErr == nil {
+		fmt.Fprintf(output, "当前状态：活跃拉取 %d，排队拉取 %d。\n", status.ActivePulls, status.QueuedPulls)
+	}
 	if *force {
 		fmt.Fprintln(output, "正在强制停止：活跃 Docker 拉取会中断，并由 Docker 按其重试策略处理。")
 	} else {
-		fmt.Fprintln(output, "已请求平滑停止：停止接收新请求，活跃拉取最多等待 30 秒后才会被关闭。")
+		fmt.Fprintln(output, "正在平滑停止：停止接收新请求，活跃拉取最多排空 30 秒；排空期间会持续报告进度。若无法继续等待，可另行执行 drg stop --force。")
 	}
 	if err := control.StopRequest(ctx, loaded.DataDir, *force); err != nil {
 		fmt.Fprintf(errorOutput, "停止请求失败: %v\n", err)
 		return 1
 	}
-	return 0
+	if *force {
+		fmt.Fprintln(output, "强制停止请求已被 Gateway 接受。")
+		return 0
+	}
+	return waitForGatewayStop(ctx, loaded.DataDir, output, errorOutput)
+}
+
+func waitForGatewayStop(ctx context.Context, dataDir string, output, errorOutput io.Writer) int {
+	const (
+		stopWaitLimit      = 35 * time.Second
+		stopProgressPeriod = 5 * time.Second
+	)
+	started := time.Now()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	timeout := time.NewTimer(stopWaitLimit)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(errorOutput, "等待 Gateway 停止被取消: %v\n", ctx.Err())
+			return 1
+		case <-timeout.C:
+			fmt.Fprintln(errorOutput, "Gateway 未在 35 秒内停止；它可能仍在排空连接。请运行 drg status 查看状态，确认后可使用 drg stop --force。")
+			return 1
+		case <-ticker.C:
+			statusContext, cancel := context.WithTimeout(context.Background(), time.Second)
+			status, err := control.StatusRequest(statusContext, dataDir)
+			cancel()
+			if err != nil {
+				fmt.Fprintln(output, "Gateway 已停止。")
+				return 0
+			}
+			if time.Since(started) >= stopProgressPeriod {
+				fmt.Fprintf(output, "仍在排空：活跃拉取 %d，排队拉取 %d，已等待 %s。\n", status.ActivePulls, status.QueuedPulls, time.Since(started).Round(time.Second))
+			}
+		}
+	}
 }
 
 func runRestart(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {

@@ -224,6 +224,7 @@ providers:
 		t.Fatalf("seed lease store: %v", err)
 	}
 
+	var stopOutput string
 	for _, command := range [][]string{
 		{"status", "--config", configPath},
 		{"reload", "--config", configPath},
@@ -236,6 +237,12 @@ providers:
 		if exitCode := cli.Run(context.Background(), command, strings.NewReader(""), &output, &errors); exitCode != 0 {
 			t.Fatalf("drg %s exit code = %d, stderr = %s", command[0], exitCode, errors.String())
 		}
+		if command[0] == "stop" {
+			stopOutput = output.String()
+		}
+	}
+	if !strings.Contains(stopOutput, "当前状态：活跃拉取 3") || !strings.Contains(stopOutput, "强制停止请求已被 Gateway 接受") {
+		t.Errorf("stop output = %q, want active-pull context and accepted force stop", stopOutput)
 	}
 	if reloads != 3 {
 		t.Errorf("reload count = %d, want 3", reloads)
@@ -302,8 +309,11 @@ providers:
 	if exitCode := cli.Run(context.Background(), []string{"reload", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("reload exit code = %d, stderr = %s", exitCode, errors.String())
 	}
-	if exitCode := cli.Run(context.Background(), []string{"stop", "--force", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+	if exitCode := cli.Run(context.Background(), []string{"stop", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("stop exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	if !strings.Contains(output.String(), "Gateway 已停止") {
+		t.Errorf("graceful stop output = %q, want confirmed completion", output.String())
 	}
 	select {
 	case exitCode := <-done:
