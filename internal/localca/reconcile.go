@@ -19,7 +19,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -85,8 +84,16 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 	}
 
 	pkiDirectory := filepath.Join(options.DataDir, "pki")
+	pkiExisted := fileExists(pkiDirectory)
 	if err := os.MkdirAll(pkiDirectory, 0o700); err != nil {
 		return Result{}, fmt.Errorf("create PKI directory: %w", err)
+	}
+	if !pkiExisted {
+		if err := preparePrivateDataDirectory(pkiDirectory); err != nil {
+			return Result{}, err
+		}
+	} else if err := verifyPrivateDataDirectory(pkiDirectory); err != nil {
+		return Result{}, err
 	}
 
 	result := Result{
@@ -151,7 +158,7 @@ func PrepareRootRotation(ctx context.Context, options Options) (Result, error) {
 		if err != nil || !pendingRoot.IsCA {
 			return Result{}, errors.New("pending local CA certificate is invalid")
 		}
-		if err := verifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
+		if err := VerifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
 			return Result{}, err
 		}
 		if _, err := readECPrivateKey(result.PendingKeyPath); err != nil {
@@ -194,7 +201,7 @@ func ActivateRootRotation(ctx context.Context, options Options) (Result, error) 
 	if err != nil || !pendingRoot.IsCA {
 		return Result{}, errors.New("pending local CA certificate is invalid")
 	}
-	if err := verifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
+	if err := VerifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
 		return Result{}, err
 	}
 	pendingKey, err := readECPrivateKey(result.PendingKeyPath)
@@ -296,7 +303,7 @@ func loadOrCreateRoot(certificatePath, keyPath, identityPath string, now time.Ti
 	if !certificate.IsCA {
 		return nil, nil, false, errors.New("stored local CA certificate is not a certificate authority")
 	}
-	if err := verifyPrivateKeyPermissions(keyPath); err != nil {
+	if err := VerifyPrivateKeyPermissions(keyPath); err != nil {
 		return nil, nil, false, err
 	}
 	key, err := readECPrivateKey(keyPath)
@@ -310,23 +317,6 @@ func loadOrCreateRoot(certificatePath, keyPath, identityPath string, now time.Ti
 		return nil, nil, false, err
 	}
 	return certificate, key, false, nil
-}
-
-func verifyPrivateKeyPermissions(path string) error {
-	if runtime.GOOS == "windows" {
-		// Windows access is protected by the containing data-directory ACL. The
-		// file is always created through atomicWrite with owner-only intent; the
-		// platform-specific ACL inspection is handled by the deployment doctor.
-		return nil
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return errors.New("local CA private key permissions allow group or other access")
-	}
-	return nil
 }
 
 func createRoot(now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {
@@ -426,6 +416,9 @@ func loadLeaf(certificatePath, keyPath string) (*x509.Certificate, *ecdsa.Privat
 	}
 	certificate, err := readCertificate(certificatePath)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := VerifyPrivateKeyPermissions(keyPath); err != nil {
 		return nil, nil, err
 	}
 	key, err := readECPrivateKey(keyPath)

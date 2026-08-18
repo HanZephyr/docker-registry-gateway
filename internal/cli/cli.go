@@ -1682,6 +1682,14 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	if _, err := tls.LoadX509KeyPair(certificatePath, keyPath); err != nil {
 		return err
 	}
+	if loaded.Server.TLS.LocalCA {
+		if err := localca.VerifyPrivateKeyPermissions(filepath.Join(loaded.DataDir, "pki", "ca.key")); err != nil {
+			return err
+		}
+		if err := localca.VerifyPrivateKeyPermissions(keyPath); err != nil {
+			return err
+		}
+	}
 	contents, err := os.ReadFile(certificatePath)
 	if err != nil {
 		return err
