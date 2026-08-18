@@ -16,6 +16,16 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 )
 
+const (
+	defaultStallTimeout       = 15 * time.Second
+	speedSwitchAfterBytes     = 1 << 20
+	speedSwitchAfterDuration  = time.Second
+	speedSwitchImprovementMin = 1.5
+)
+
+var errProviderStalled = errors.New("provider stream made no progress")
+var errProviderSlow = errors.New("provider stream is materially slower than a known alternative")
+
 // Source binds Provider roles to a Registry content backend.
 type Source struct {
 	Name         string
@@ -61,6 +71,7 @@ type Options struct {
 	DecisionLease            time.Duration
 	LeaseStore               *lease.Store
 	Observer                 Observer
+	StallTimeout             time.Duration
 }
 
 // Router implements the downstream Registry backend using multiple Providers.
@@ -79,6 +90,7 @@ type Router struct {
 	temporaryDir             string
 	tempBudget               *TempBudget
 	observer                 Observer
+	stallTimeout             time.Duration
 }
 
 // New creates a Router. Configuration validation guarantees sources contain
@@ -108,6 +120,10 @@ func New(sources []Source, options Options) *Router {
 	if maxSegments < 1 {
 		maxSegments = 1
 	}
+	stallTimeout := options.StallTimeout
+	if stallTimeout <= 0 {
+		stallTimeout = defaultStallTimeout
+	}
 	return &Router{
 		sources:                  append([]Source(nil), sources...),
 		conflictStrategy:         conflictStrategy,
@@ -123,6 +139,7 @@ func New(sources []Source, options Options) *Router {
 		temporaryDir:             options.TemporaryDir,
 		tempBudget:               options.TempBudget,
 		observer:                 options.Observer,
+		stallTimeout:             stallTimeout,
 	}
 }
 
@@ -369,34 +386,40 @@ func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHea
 	for _, index := range router.health.orderedPullSourceIndexes(router.sources) {
 		attemptedSource = true
 		source := router.sources[index]
-		blob, err := source.Backend.Blob(ctx, repository, digest, rangeHeader)
+		attemptContext, cancel := context.WithCancel(ctx)
+		startedAttempt := time.Now()
+		blob, err := source.Backend.Blob(attemptContext, repository, digest, rangeHeader)
 		if err == nil {
+			router.health.RecordFirstByte(source.Name, time.Since(startedAttempt))
 			if !validInitialBlob(blob, digest) {
 				if blob.Reader != nil {
 					_ = blob.Reader.Close()
 				}
+				cancel()
 				router.recordSourceFailure(source.Name, registry.NewFailure(registry.FailureIntegrity, 0, errors.New("invalid initial blob metadata")))
 				allNotFound = false
 				continue
 			}
 			attempted[index] = true
 			blob.Reader = &resumableBlobReader{
-				ctx:         ctx,
-				router:      router,
-				repository:  repository,
-				digest:      digest,
-				current:     blob.Reader,
-				currentAt:   index,
-				currentName: source.Name,
-				startedAt:   time.Now(),
-				attempted:   attempted,
-				offset:      blob.Start,
-				end:         blob.End,
-				size:        blob.Size,
+				ctx:           ctx,
+				router:        router,
+				repository:    repository,
+				digest:        digest,
+				current:       blob.Reader,
+				currentCancel: cancel,
+				currentAt:     index,
+				currentName:   source.Name,
+				startedAt:     time.Now(),
+				attempted:     attempted,
+				offset:        blob.Start,
+				end:           blob.End,
+				size:          blob.Size,
 			}
 			router.emit(Event{Level: "info", Code: "blob_source_selected", Provider: source.Name, Repository: repository, Digest: digest, Message: "pull provider opened a blob stream"})
 			return blob, nil
 		}
+		cancel()
 		router.recordSourceFailure(source.Name, err)
 		if !errors.Is(err, registry.ErrNotFound) {
 			allNotFound = false
@@ -418,6 +441,7 @@ type resumableBlobReader struct {
 	digest     string
 
 	current       io.ReadCloser
+	currentCancel context.CancelFunc
 	currentAt     int
 	currentName   string
 	startedAt     time.Time
@@ -436,7 +460,26 @@ func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
 		reader.pending = nil
 		return reader.resume(buffer, pending)
 	}
+	canSwitch := reader.hasUntriedPullSource()
+	stalled := make(chan struct{}, 1)
+	var timer *time.Timer
+	cancelCurrent := reader.currentCancel
+	if canSwitch && cancelCurrent != nil && reader.router.stallTimeout > 0 {
+		timer = time.AfterFunc(reader.router.stallTimeout, func() {
+			cancelCurrent()
+			stalled <- struct{}{}
+		})
+	}
 	count, err := reader.current.Read(buffer)
+	if timer != nil {
+		timer.Stop()
+	}
+	wasStalled := false
+	select {
+	case <-stalled:
+		wasStalled = true
+	default:
+	}
 	reader.offset += int64(count)
 	reader.transferBytes += int64(count)
 	if reader.offset > reader.end+1 {
@@ -451,10 +494,17 @@ func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
 		return count, err
 	}
 	if count > 0 {
-		if err != nil {
+		if wasStalled {
+			reader.pending = errProviderStalled
+		} else if err != nil {
 			reader.pending = err
+		} else if reader.shouldSwitchForSpeed() {
+			reader.pending = errProviderSlow
 		}
 		return count, nil
+	}
+	if wasStalled {
+		return reader.resume(buffer, errProviderStalled)
 	}
 	if err == nil {
 		return 0, nil
@@ -464,7 +514,13 @@ func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
 
 func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, error) {
 	_ = reader.current.Close()
-	reader.recordFailure()
+	if reader.currentCancel != nil {
+		reader.currentCancel()
+		reader.currentCancel = nil
+	}
+	if !errors.Is(cause, errProviderStalled) && !errors.Is(cause, errProviderSlow) {
+		reader.recordFailure()
+	}
 	for _, index := range reader.router.health.orderedPullSourceIndexes(reader.router.sources) {
 		source := reader.router.sources[index]
 		if reader.attempted[index] {
@@ -472,26 +528,42 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 		}
 		reader.attempted[index] = true
 		rangeHeader := fmt.Sprintf("bytes=%d-%d", reader.offset, reader.end)
-		blob, err := source.Backend.Blob(reader.ctx, reader.repository, reader.digest, rangeHeader)
+		attemptContext, cancel := context.WithCancel(reader.ctx)
+		startedAttempt := time.Now()
+		blob, err := source.Backend.Blob(attemptContext, reader.repository, reader.digest, rangeHeader)
 		if err == nil && validResumedBlob(blob, reader.digest, reader.offset, reader.end, reader.size) {
+			reader.router.health.RecordFirstByte(source.Name, time.Since(startedAttempt))
 			previous := reader.currentName
 			reader.current = blob.Reader
+			reader.currentCancel = cancel
 			reader.currentAt = index
 			reader.currentName = source.Name
 			reader.startedAt = time.Now()
 			reader.transferBytes = 0
 			reader.recorded = false
-			reader.router.emit(Event{Level: "warning", Code: "blob_source_switched", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, Message: fmt.Sprintf("resumed interrupted blob stream after switching from %s", previous)})
+			reason := fmt.Sprintf("resumed interrupted blob stream after switching from %s", previous)
+			switch {
+			case errors.Is(cause, errProviderStalled):
+				reason = fmt.Sprintf("switched from %s after it made no progress", previous)
+			case errors.Is(cause, errProviderSlow):
+				reason = fmt.Sprintf("switched from %s because an available Provider had materially better recent throughput", previous)
+			}
+			reader.router.emit(Event{Level: "warning", Code: "blob_source_switched", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, Message: reason})
 			return reader.Read(buffer)
 		}
 		if blob.Reader != nil {
 			_ = blob.Reader.Close()
 		}
+		cancel()
 		if reader.router.noRangeRestartEnabled && reader.offset <= reader.router.maxNoRangeRestartDiscard {
-			if restarted, restartedErr := source.Backend.Blob(reader.ctx, reader.repository, reader.digest, ""); restartedErr == nil {
+			restartContext, restartCancel := context.WithCancel(reader.ctx)
+			startedRestart := time.Now()
+			if restarted, restartedErr := source.Backend.Blob(restartContext, reader.repository, reader.digest, ""); restartedErr == nil {
 				if validRestartedBlob(restarted, reader.digest, reader.size) {
+					reader.router.health.RecordFirstByte(source.Name, time.Since(startedRestart))
 					if _, discardErr := io.CopyN(io.Discard, restarted.Reader, reader.offset); discardErr == nil {
 						reader.current = restarted.Reader
+						reader.currentCancel = restartCancel
 						reader.currentAt = index
 						reader.currentName = source.Name
 						reader.startedAt = time.Now()
@@ -505,6 +577,7 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 					_ = restarted.Reader.Close()
 				}
 			}
+			restartCancel()
 		}
 		reader.router.recordSourceFailure(source.Name, err)
 	}
@@ -558,7 +631,29 @@ func (reader *resumableBlobReader) recordFailure() {
 	reader.router.health.RecordFailure(reader.currentName)
 }
 
+func (reader *resumableBlobReader) hasUntriedPullSource() bool {
+	for _, index := range reader.router.health.orderedPullSourceIndexes(reader.router.sources) {
+		if !reader.attempted[index] {
+			return true
+		}
+	}
+	return false
+}
+
+func (reader *resumableBlobReader) shouldSwitchForSpeed() bool {
+	elapsed := time.Since(reader.startedAt)
+	if reader.transferBytes < speedSwitchAfterBytes || elapsed < speedSwitchAfterDuration {
+		return false
+	}
+	currentRate := float64(reader.transferBytes) / elapsed.Seconds()
+	return reader.router.health.hasClearlyBetterPullSource(reader.router.sources, reader.currentName, reader.attempted, currentRate)
+}
+
 func (reader *resumableBlobReader) Close() error {
+	if reader.currentCancel != nil {
+		reader.currentCancel()
+		reader.currentCancel = nil
+	}
 	if reader.current == nil {
 		return nil
 	}

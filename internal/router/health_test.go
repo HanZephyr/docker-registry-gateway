@@ -1,9 +1,11 @@
 package router_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/router"
 )
 
@@ -42,5 +44,30 @@ func TestHealthProbeSuccessRestoresAuthenticationAndIntegrityStates(t *testing.T
 	}
 	if snapshots[0].AuthenticationInvalid || snapshots[0].IntegrityInvalid {
 		t.Errorf("probe-recovered snapshot = %#v, want no persistent exclusion", snapshots[0])
+	}
+}
+
+func TestHealthPrefersProviderWithLowerRecentFirstByteLatency(t *testing.T) {
+	t.Parallel()
+
+	health := router.NewHealth()
+	health.RecordFirstByte("slow", 400*time.Millisecond)
+	health.RecordFirstByte("fast", 20*time.Millisecond)
+	var attempts []string
+	backend := func(name string) functionBackend {
+		return functionBackend{blob: func(context.Context, string, string, string) (registry.Blob, error) {
+			attempts = append(attempts, name)
+			return registry.Blob{Digest: "sha256:blob", Size: 1, Start: 0, End: 0, Reader: ioNopCloser("x")}, nil
+		}}
+	}
+	gateway := router.New([]router.Source{
+		{Name: "slow", PullProvider: true, Backend: backend("slow")},
+		{Name: "fast", PullProvider: true, Backend: backend("fast")},
+	}, router.Options{Health: health})
+	if _, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", ""); err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	if len(attempts) != 1 || attempts[0] != "fast" {
+		t.Errorf("attempts = %v, want fast Provider first", attempts)
 	}
 }

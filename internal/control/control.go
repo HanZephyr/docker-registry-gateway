@@ -35,6 +35,7 @@ type Status struct {
 type ProviderHealth struct {
 	Name                     string    `json:"name"`
 	ThroughputBytesPerSecond float64   `json:"throughput_bytes_per_second"`
+	FirstByteMillis          float64   `json:"first_byte_millis"`
 	Failures                 int       `json:"failures"`
 	LastSuccess              time.Time `json:"last_success,omitempty"`
 	LastFailure              time.Time `json:"last_failure,omitempty"`

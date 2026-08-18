@@ -21,6 +21,8 @@ type Health struct {
 type healthState struct {
 	throughputBytesPerSecond float64
 	hasThroughput            bool
+	firstByte                time.Duration
+	hasFirstByte             bool
 	failures                 int
 	lastSuccess              time.Time
 	lastFailure              time.Time
@@ -35,6 +37,7 @@ type healthState struct {
 type HealthSnapshot struct {
 	Provider                 string
 	ThroughputBytesPerSecond float64
+	FirstByte                time.Duration
 	Failures                 int
 	LastSuccess              time.Time
 	LastFailure              time.Time
@@ -69,6 +72,25 @@ func (health *Health) RecordSuccess(provider string, bytes int64, elapsed time.D
 	state.rateLimitedUntil = time.Time{}
 	state.authenticationInvalid = false
 	state.integrityInvalid = false
+	health.states[provider] = state
+}
+
+// RecordFirstByte incorporates the latency to receive an upstream response's
+// first byte or headers. It is intentionally measured from real transfers,
+// not a user-configured synthetic timeout.
+func (health *Health) RecordFirstByte(provider string, elapsed time.Duration) {
+	if health == nil || provider == "" || elapsed <= 0 {
+		return
+	}
+	health.mu.Lock()
+	defer health.mu.Unlock()
+	state := health.states[provider]
+	if state.hasFirstByte {
+		state.firstByte = time.Duration(float64(state.firstByte)*0.7 + float64(elapsed)*0.3)
+	} else {
+		state.firstByte = elapsed
+		state.hasFirstByte = true
+	}
 	health.states[provider] = state
 }
 
@@ -155,6 +177,7 @@ func (health *Health) Snapshot() []HealthSnapshot {
 		result = append(result, HealthSnapshot{
 			Provider:                 provider,
 			ThroughputBytesPerSecond: state.throughputBytesPerSecond,
+			FirstByte:                state.firstByte,
 			Failures:                 state.failures,
 			LastSuccess:              state.lastSuccess,
 			LastFailure:              state.lastFailure,
@@ -187,6 +210,10 @@ func (health *Health) Restore(snapshots []HealthSnapshot) {
 			state.throughputBytesPerSecond = snapshot.ThroughputBytesPerSecond
 			state.hasThroughput = true
 		}
+		if snapshot.FirstByte > 0 {
+			state.firstByte = snapshot.FirstByte
+			state.hasFirstByte = true
+		}
 		state.lastSuccess = snapshot.LastSuccess.UTC()
 		state.lastFailure = snapshot.LastFailure.UTC()
 		state.failures = 0
@@ -218,6 +245,12 @@ func (health *Health) orderedPullSourceIndexes(sources []Source) []int {
 		}
 		if leftState.hasThroughput != rightState.hasThroughput {
 			return leftState.hasThroughput
+		}
+		if leftState.hasFirstByte != rightState.hasFirstByte {
+			return leftState.hasFirstByte
+		}
+		if leftState.hasFirstByte && leftState.firstByte != rightState.firstByte {
+			return leftState.firstByte < rightState.firstByte
 		}
 		if leftState.hasThroughput && leftState.throughputBytesPerSecond != rightState.throughputBytesPerSecond {
 			return leftState.throughputBytesPerSecond > rightState.throughputBytesPerSecond
@@ -265,6 +298,28 @@ func (health *Health) unavailableError(sources []Source, resolver bool) error {
 		return registry.NewFailure(registry.FailureRateLimited, time.Until(earliest), nil)
 	}
 	return registry.ErrUnavailable
+}
+
+func (health *Health) hasClearlyBetterPullSource(sources []Source, current string, attempted map[int]bool, currentRate float64) bool {
+	if health == nil || currentRate <= 0 {
+		return false
+	}
+	health.mu.RLock()
+	states := make(map[string]healthState, len(health.states))
+	for provider, state := range health.states {
+		states[provider] = state
+	}
+	health.mu.RUnlock()
+	for _, index := range health.orderedPullSourceIndexes(sources) {
+		if attempted[index] || sources[index].Name == current {
+			continue
+		}
+		state := states[sources[index].Name]
+		if state.hasThroughput && state.throughputBytesPerSecond >= currentRate*speedSwitchImprovementMin {
+			return true
+		}
+	}
+	return false
 }
 
 func configuredSourcePrecedes(left, right Source, leftIndex, rightIndex int) bool {

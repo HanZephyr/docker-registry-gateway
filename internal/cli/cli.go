@@ -602,10 +602,11 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 	}
 	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；排队拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, status.QueuedPulls, strings.Join(status.Listeners, ", "))
 	for _, provider := range status.Providers {
-		fmt.Fprintf(output, "Provider %s：状态 %s；近期吞吐 %.2f MiB/s；本进程失败 %d；最近成功 %s；最近失败 %s\n",
+		fmt.Fprintf(output, "Provider %s：状态 %s；近期吞吐 %.2f MiB/s；首字节 %.0f ms；本进程失败 %d；最近成功 %s；最近失败 %s\n",
 			provider.Name,
 			formatProviderState(provider),
 			provider.ThroughputBytesPerSecond/(1<<20),
+			provider.FirstByteMillis,
 			provider.Failures,
 			formatHealthTime(provider.LastSuccess),
 			formatHealthTime(provider.LastFailure),
@@ -620,6 +621,7 @@ func providerHealthStatuses(snapshots []router.HealthSnapshot) []control.Provide
 		result = append(result, control.ProviderHealth{
 			Name:                     snapshot.Provider,
 			ThroughputBytesPerSecond: snapshot.ThroughputBytesPerSecond,
+			FirstByteMillis:          float64(snapshot.FirstByte) / float64(time.Millisecond),
 			Failures:                 snapshot.Failures,
 			LastSuccess:              snapshot.LastSuccess,
 			LastFailure:              snapshot.LastFailure,

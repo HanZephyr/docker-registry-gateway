@@ -348,6 +348,84 @@ func TestBlobResumesFromNextRangeProviderAfterInterruptedRead(t *testing.T) {
 	}
 }
 
+func TestBlobSwitchesAwayFromStalledProviderAndResumesAtExactOffset(t *testing.T) {
+	contents := []byte("fast")
+	stalled := functionBackend{blob: func(ctx context.Context, _ string, digest, _ string) (registry.Blob, error) {
+		return registry.Blob{Digest: digest, Size: int64(len(contents)), Start: 0, End: int64(len(contents) - 1), Reader: &contextBlockingReadCloser{ctx: ctx}}, nil
+	}}
+	var fallbackRange string
+	fallback := functionBackend{blob: func(_ context.Context, _ string, digest, rangeHeader string) (registry.Blob, error) {
+		fallbackRange = rangeHeader
+		return registry.Blob{Digest: digest, Size: int64(len(contents)), Start: 0, End: int64(len(contents) - 1), Reader: io.NopCloser(bytes.NewReader(contents))}, nil
+	}}
+	var events []router.Event
+	gateway := router.New([]router.Source{
+		{Name: "stalled", PullProvider: true, Backend: stalled},
+		{Name: "fallback", PullProvider: true, Backend: fallback},
+	}, router.Options{StallTimeout: 10 * time.Millisecond, Observer: router.ObserverFunc(func(event router.Event) { events = append(events, event) })})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+	got, err := io.ReadAll(blob.Reader)
+	if err != nil {
+		t.Fatalf("read stalled blob fallback: %v", err)
+	}
+	if got, want := string(got), string(contents); got != want {
+		t.Errorf("blob = %q, want %q", got, want)
+	}
+	if got, want := fallbackRange, "bytes=0-3"; got != want {
+		t.Errorf("fallback range = %q, want %q", got, want)
+	}
+	if !containsEventCode(events, "blob_source_switched") {
+		t.Errorf("events = %#v, want a stalled-source switch event", events)
+	}
+}
+
+func TestBlobSwitchesToMateriallyFasterKnownProvider(t *testing.T) {
+	contents := bytes.Repeat([]byte("x"), 2<<20)
+	tracker := router.NewHealth()
+	slow := functionBackend{blob: func(_ context.Context, _ string, digest, _ string) (registry.Blob, error) {
+		return registry.Blob{Digest: digest, Size: int64(len(contents)), Start: 0, End: int64(len(contents) - 1), Reader: &pacedReadCloser{contents: contents, chunk: 64 << 10, delay: 50 * time.Millisecond}}, nil
+	}}
+	var fallbackRange string
+	fast := functionBackend{blob: func(_ context.Context, _ string, digest, rangeHeader string) (registry.Blob, error) {
+		fallbackRange = rangeHeader
+		start, end, err := parseTestRange(rangeHeader, int64(len(contents)))
+		if err != nil {
+			return registry.Blob{}, err
+		}
+		return registry.Blob{Digest: digest, Size: int64(len(contents)), Start: start, End: end, Reader: io.NopCloser(bytes.NewReader(contents[start : end+1]))}, nil
+	}}
+	var events []router.Event
+	gateway := router.New([]router.Source{
+		{Name: "slow", PullProvider: true, Backend: slow},
+		{Name: "fast", PullProvider: true, Backend: fast},
+	}, router.Options{Health: tracker, Observer: router.ObserverFunc(func(event router.Event) { events = append(events, event) })})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+	tracker.RecordSuccess("fast", 100<<20, time.Second)
+	got, err := io.ReadAll(blob.Reader)
+	if err != nil {
+		t.Fatalf("read speed-switched blob: %v", err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Errorf("downloaded contents differ after speed switch")
+	}
+	if fallbackRange == "" || fallbackRange == "bytes=0-2097151" {
+		t.Errorf("fallback range = %q, want a non-zero exact resume range", fallbackRange)
+	}
+	if !containsEventCode(events, "blob_source_switched") {
+		t.Errorf("events = %#v, want speed-based switch event", events)
+	}
+}
+
 func TestBlobRestartsAndSkipsWhenNoRangeFallbackFitsBudget(t *testing.T) {
 	t.Parallel()
 
@@ -504,6 +582,40 @@ func (reader *failingReadCloser) Read(buffer []byte) (int, error) {
 }
 
 func (*failingReadCloser) Close() error { return nil }
+
+type contextBlockingReadCloser struct{ ctx context.Context }
+
+func (reader *contextBlockingReadCloser) Read([]byte) (int, error) {
+	<-reader.ctx.Done()
+	return 0, reader.ctx.Err()
+}
+
+func (*contextBlockingReadCloser) Close() error { return nil }
+
+type pacedReadCloser struct {
+	contents []byte
+	chunk    int
+	delay    time.Duration
+}
+
+func (reader *pacedReadCloser) Read(buffer []byte) (int, error) {
+	if len(reader.contents) == 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(reader.delay)
+	count := len(buffer)
+	if count > reader.chunk {
+		count = reader.chunk
+	}
+	if count > len(reader.contents) {
+		count = len(reader.contents)
+	}
+	copy(buffer[:count], reader.contents[:count])
+	reader.contents = reader.contents[count:]
+	return count, nil
+}
+
+func (*pacedReadCloser) Close() error { return nil }
 
 type rangeBackend struct {
 	mu                  sync.Mutex
