@@ -345,3 +345,23 @@ providers:
 		t.Fatalf("config.Load() error = %v, want incomplete external TLS rejection", err)
 	}
 }
+
+func TestLoadRejectsProviderWithoutAnyRole(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: unusable
+    url: https://mirror.example.test
+    resolver: false
+    pull_provider: false
+`))
+	if err == nil || !strings.Contains(err.Error(), "at least one role") {
+		t.Fatalf("config.Load() error = %v, want role rejection", err)
+	}
+}

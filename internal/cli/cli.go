@@ -35,6 +35,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 	"github.com/hjx/docker-registry-gateway/internal/router"
 	"github.com/hjx/docker-registry-gateway/internal/trust"
+	"gopkg.in/yaml.v3"
 )
 
 // Run executes a drg command and returns a process-compatible exit code.
@@ -69,6 +70,8 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runResolver(ctx, arguments[1:], output, errorOutput)
 	case "tls":
 		return runTLS(ctx, arguments[1:], output, errorOutput)
+	case "provider":
+		return runProvider(ctx, arguments[1:], output, errorOutput)
 	case "help", "--help", "-h":
 		printUsage(output)
 		return 0
@@ -118,6 +121,251 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 	}
 	fmt.Fprintf(output, "TLS 对账完成：CA=%s，证书=%s，本次新建根 CA=%t，本次签发叶子证书=%t\n", result.CAPath, result.Certificate, result.RootCreated, result.LeafIssued)
 	return 0
+}
+
+func runProvider(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	if len(arguments) == 0 {
+		fmt.Fprintln(errorOutput, "用法：drg provider <list|add|remove> ...")
+		return 2
+	}
+	switch arguments[0] {
+	case "list":
+		return runProviderList(arguments[1:], output, errorOutput)
+	case "add":
+		return runProviderAdd(ctx, arguments[1:], output, errorOutput)
+	case "remove":
+		return runProviderRemove(ctx, arguments[1:], output, errorOutput)
+	default:
+		fmt.Fprintf(errorOutput, "未知 Provider 命令 %q。可用命令：list、add、remove。\n", arguments[0])
+		return 2
+	}
+}
+
+func runProviderList(arguments []string, output, errorOutput io.Writer) int {
+	loaded, exitCode := loadControlConfiguration("provider list", arguments, errorOutput)
+	if exitCode != 0 {
+		return exitCode
+	}
+	for _, provider := range loaded.Providers {
+		roles := make([]string, 0, 2)
+		if provider.Resolver {
+			roles = append(roles, "resolver")
+		}
+		if provider.PullProvider {
+			roles = append(roles, "pull")
+		}
+		priority := ""
+		if provider.Priority != nil {
+			priority = fmt.Sprintf("；priority=%d", *provider.Priority)
+		}
+		fmt.Fprintf(output, "%s：%s；角色=%s%s\n", provider.Name, provider.URL, strings.Join(roles, ","), priority)
+	}
+	return 0
+}
+
+func runProviderAdd(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("provider add", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	name := flags.String("name", "", "Provider 名称")
+	address := flags.String("url", "", "Provider Registry URL")
+	resolver := flags.Bool("resolver", false, "作为 manifest 解析源")
+	pullProvider := flags.Bool("pull-provider", true, "作为 blob 下载源")
+	priority := flags.String("priority", "", "可选解析优先级（非负整数）")
+	username := flags.String("username", "", "上游用户名")
+	password := flags.String("password", "", "上游密码或 PAT（不推荐明文）")
+	secretFile := flags.String("secret-file", "", "含单行密码或 PAT 的文件")
+	caFile := flags.String("ca-file", "", "上游 HTTPS 私有根证书")
+	allowInsecureHTTP := flags.Bool("allow-insecure-http", false, "允许 HTTP Provider")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(errorOutput, "provider add 不接受位置参数")
+		}
+		return 2
+	}
+	if strings.TrimSpace(*name) == "" || strings.TrimSpace(*address) == "" {
+		fmt.Fprintln(errorOutput, "provider add 必须提供 --name 和 --url")
+		return 2
+	}
+	if !*resolver && !*pullProvider {
+		fmt.Fprintln(errorOutput, "Provider 至少必须承担 resolver 或 pull-provider 之一")
+		return 2
+	}
+	loaded, resolvedConfigPath, exitCode := loadConfigAtPath(*configPath, errorOutput)
+	if exitCode != 0 {
+		return exitCode
+	}
+	provider := config.Provider{
+		Name:              strings.TrimSpace(*name),
+		URL:               strings.TrimSpace(*address),
+		Resolver:          *resolver,
+		PullProvider:      *pullProvider,
+		AllowInsecureHTTP: *allowInsecureHTTP,
+		Auth: config.Auth{
+			Username: strings.TrimSpace(*username),
+			Password: strings.TrimSpace(*password),
+		},
+	}
+	if *secretFile != "" {
+		provider.Auth.SecretFile = resolveCLIPath(resolvedConfigPath, *secretFile)
+	}
+	if *caFile != "" {
+		provider.CAFile = resolveCLIPath(resolvedConfigPath, *caFile)
+	}
+	if *priority != "" {
+		value, err := strconv.Atoi(*priority)
+		if err != nil || value < 0 {
+			fmt.Fprintln(errorOutput, "--priority 必须是非负整数")
+			return 2
+		}
+		provider.Priority = &value
+	}
+	candidate := loaded
+	candidate.Providers = append(append([]config.Provider(nil), loaded.Providers...), provider)
+	return applyProviderConfiguration(ctx, resolvedConfigPath, candidate, "已添加 Provider "+provider.Name, output, errorOutput)
+}
+
+func runProviderRemove(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("provider remove", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
+		fmt.Fprintln(errorOutput, "用法：drg provider remove --config <路径> <名称>")
+		return 2
+	}
+	loaded, resolvedConfigPath, exitCode := loadConfigAtPath(*configPath, errorOutput)
+	if exitCode != 0 {
+		return exitCode
+	}
+	name := strings.TrimSpace(flags.Arg(0))
+	candidate := loaded
+	candidate.Providers = make([]config.Provider, 0, len(loaded.Providers)-1)
+	removed := false
+	for _, provider := range loaded.Providers {
+		if provider.Name == name {
+			removed = true
+			continue
+		}
+		candidate.Providers = append(candidate.Providers, provider)
+	}
+	if !removed {
+		fmt.Fprintf(errorOutput, "Provider %q 不存在。\n", name)
+		return 1
+	}
+	return applyProviderConfiguration(ctx, resolvedConfigPath, candidate, "已删除 Provider "+name, output, errorOutput)
+}
+
+func loadConfigAtPath(path string, errorOutput io.Writer) (config.Config, string, int) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		absPath = path
+	}
+	loaded, err := config.LoadFile(absPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return config.Config{}, "", 1
+	}
+	return loaded, absPath, 0
+}
+
+func applyProviderConfiguration(ctx context.Context, configPath string, candidate config.Config, message string, output, errorOutput io.Writer) int {
+	backupPath, original, err := writeConfigurationWithBackup(configPath, candidate)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "保存 Provider 配置失败: %v\n", err)
+		return 1
+	}
+	if _, infoErr := control.LoadInfo(candidate.DataDir); infoErr == nil {
+		if reloadErr := control.ReloadRequest(ctx, candidate.DataDir); reloadErr != nil {
+			if restoreErr := activateConfiguration(configPath, original); restoreErr != nil {
+				fmt.Fprintf(errorOutput, "热加载失败且无法恢复旧配置: %v；恢复错误: %v\n", reloadErr, restoreErr)
+			} else {
+				fmt.Fprintf(errorOutput, "热加载失败，已恢复旧配置: %v\n", reloadErr)
+			}
+			return 1
+		}
+		fmt.Fprintf(output, "%s；已热加载；备份=%s\n", message, backupPath)
+		return 0
+	}
+	fmt.Fprintf(output, "%s；服务未运行，已保存配置；下次 start 或手动 reload 生效；备份=%s\n", message, backupPath)
+	return 0
+}
+
+func writeConfigurationWithBackup(path string, candidate config.Config) (string, []byte, error) {
+	original, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, err
+	}
+	localCA := candidate.Server.TLS.LocalCA
+	candidate.Server.TLS.LocalCASpecified = &localCA
+	installTrust := candidate.Server.TLS.InstallTrust
+	candidate.Server.TLS.InstallTrustSpecified = &installTrust
+	allowNonRange := candidate.AllowNonRangeProviders
+	candidate.AllowNonRangeProvidersSpecified = &allowNonRange
+	contents, err := yaml.Marshal(candidate)
+	if err != nil {
+		return "", nil, err
+	}
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".drg-provider-*.yaml")
+	if err != nil {
+		return "", nil, err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", nil, err
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		_ = temporary.Close()
+		return "", nil, err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", nil, err
+	}
+	if _, err := config.LoadFile(temporaryPath); err != nil {
+		return "", nil, fmt.Errorf("完整校验候选配置: %w", err)
+	}
+	backupPath := path + ".bak"
+	if err := os.WriteFile(backupPath, original, 0o600); err != nil {
+		return "", nil, err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return "", nil, err
+	}
+	return backupPath, original, nil
+}
+
+func activateConfiguration(path string, contents []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".drg-restore-*.yaml")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+func resolveCLIPath(configPath, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(filepath.Dir(configPath), value)
 }
 
 func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bool, output io.Writer) (localca.Result, error) {

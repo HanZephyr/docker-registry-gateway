@@ -418,6 +418,9 @@ func validateProviders(providers []Provider) error {
 			return fmt.Errorf("duplicate provider url %q", origin)
 		}
 		providerOrigins[origin] = struct{}{}
+		if !provider.Resolver && !provider.PullProvider {
+			return fmt.Errorf("provider %q must have at least one role", provider.Name)
+		}
 		hasResolver = hasResolver || provider.Resolver
 		hasPullProvider = hasPullProvider || provider.PullProvider
 	}

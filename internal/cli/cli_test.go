@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/cli"
+	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
 	"github.com/hjx/docker-registry-gateway/internal/lease"
 )
@@ -227,6 +228,7 @@ providers:
 		{"status", "--config", configPath},
 		{"reload", "--config", configPath},
 		{"resolver", "invalidate", "--config", configPath, "library/nginx:latest"},
+		{"provider", "add", "--config", configPath, "--name", "mirror", "--url", "https://mirror.example.test", "--pull-provider"},
 		{"stop", "--force", "--config", configPath},
 	} {
 		var output bytes.Buffer
@@ -235,8 +237,8 @@ providers:
 			t.Fatalf("drg %s exit code = %d, stderr = %s", command[0], exitCode, errors.String())
 		}
 	}
-	if reloads != 2 {
-		t.Errorf("reload count = %d, want 2", reloads)
+	if reloads != 3 {
+		t.Errorf("reload count = %d, want 3", reloads)
 	}
 	updatedLeaseStore, err := lease.Open(filepath.Join(dataDir, "decision-leases.json"), time.Now())
 	if err != nil {
@@ -364,5 +366,55 @@ providers:
 	}
 	if !strings.Contains(serveOutput.String(), "纯 HTTP") {
 		t.Errorf("serve output = %q, want explicit plain HTTP warning", serveOutput.String())
+	}
+}
+
+func TestRunProviderAddAndRemoveAtomicallyMaintainsConfiguration(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	contents := `
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: true
+    install_trust: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	var output, errors bytes.Buffer
+	add := []string{"provider", "add", "--config", configPath, "--name", "mirror", "--url", "https://mirror.example.test", "--resolver", "--pull-provider"}
+	if exitCode := cli.Run(context.Background(), add, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("provider add exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	loaded, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("load added configuration: %v", err)
+	}
+	if len(loaded.Providers) != 2 || loaded.Providers[1].Name != "mirror" {
+		t.Errorf("providers after add = %#v, want configured mirror", loaded.Providers)
+	}
+	if _, err := os.Stat(configPath + ".bak"); err != nil {
+		t.Errorf("configuration backup missing: %v", err)
+	}
+
+	output.Reset()
+	errors.Reset()
+	remove := []string{"provider", "remove", "--config", configPath, "docker_hub"}
+	if exitCode := cli.Run(context.Background(), remove, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("provider remove exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	loaded, err = config.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("load removed configuration: %v", err)
+	}
+	if len(loaded.Providers) != 1 || loaded.Providers[0].Name != "mirror" {
+		t.Errorf("providers after remove = %#v, want only mirror", loaded.Providers)
 	}
 }
