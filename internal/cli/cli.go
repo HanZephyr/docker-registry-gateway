@@ -557,6 +557,10 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintln(output, "TLS 提示：local_ca 已关闭且未配置 cert_file/key_file，Gateway 将使用纯 HTTP 后端监听。")
 	}
 	routeGuard := routeguard.New(instanceID, 3)
+	if err := requireRangeProviderAdmission(ctx, loaded, probeProviderAdmission); err != nil {
+		fmt.Fprintf(errorOutput, "Provider Range 准入失败: %v\n", err)
+		return 1
+	}
 
 	eventRetention, healthRetention, err := retentionConfiguration(loaded)
 	if err != nil {
@@ -740,6 +744,9 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
+			if err := requireRangeProviderAdmission(probeContext, candidate, probeProviderAdmission); err != nil {
+				return fmt.Errorf("Provider Range 准入失败: %w", err)
+			}
 			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
 			if err != nil {
 				return err
@@ -819,13 +826,17 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 			if err == nil {
 				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
 				if probeErr == nil {
-					tracker.RecordProbeSuccess(configured.Name)
-					_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: fmt.Sprintf("Range=%t", result.RangeSupported)})
 					if result.RangeSupported {
+						tracker.RecordProbeSuccess(configured.Name)
+						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "Range=true"})
 						fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", configured.Name)
 					} else if loaded.AllowNonRangeProviders {
+						tracker.RecordProbeSuccess(configured.Name)
+						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "Range=false; degraded"})
 						fmt.Fprintf(output, "Provider %s 准入探测通过但不支持 Range：仅作为降级下载源。\n", configured.Name)
 					} else {
+						tracker.RecordRangeUnsupported(configured.Name)
+						_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_range_unsupported", Provider: configured.Name, Message: "Provider no longer supports required Range requests and was withheld"})
 						fmt.Fprintf(output, "Provider %s 准入探测不通过：不支持 Range，当前配置已禁用无 Range Provider。\n", configured.Name)
 					}
 					cancel()
@@ -842,6 +853,32 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 		_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_probe_failed", Provider: configured.Name, Message: "provider admission probe failed"})
 		fmt.Fprintf(output, "Provider %s 主动探测失败：%v；服务将继续运行，并在下一次主动探测或后续拉取中恢复。\n", configured.Name, err)
 	}
+}
+
+// requireRangeProviderAdmission keeps hand-edited configuration from bypassing
+// the same Range requirement enforced by `drg provider add`. A Provider used
+// only for manifest resolution never serves blob bytes, so it does not need a
+// Range capability check.
+func requireRangeProviderAdmission(parent context.Context, loaded config.Config, probe func(context.Context, config.Provider, string, bool) (provider.ProbeResult, error)) error {
+	if loaded.AllowNonRangeProviders {
+		return nil
+	}
+	if probe == nil {
+		return errors.New("Provider Range 准入器不可用")
+	}
+	for _, configured := range loaded.Providers {
+		if !configured.PullProvider {
+			continue
+		}
+		result, err := probe(parent, configured, loaded.ProbeRef, false)
+		if err != nil {
+			return fmt.Errorf("Provider %s: %w", configured.Name, err)
+		}
+		if !result.RangeSupported {
+			return fmt.Errorf("Provider %s 不支持 Range", configured.Name)
+		}
+	}
+	return nil
 }
 
 // startPeriodicProviderProbes runs low-frequency, bounded admission probes so

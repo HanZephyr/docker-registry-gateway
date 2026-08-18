@@ -29,6 +29,7 @@ type healthState struct {
 	rateLimitedUntil         time.Time
 	authenticationInvalid    bool
 	integrityInvalid         bool
+	rangeUnsupported         bool
 }
 
 // HealthSnapshot is the non-secret portion of Provider transfer history. A
@@ -44,6 +45,7 @@ type HealthSnapshot struct {
 	RateLimitedUntil         time.Time
 	AuthenticationInvalid    bool
 	IntegrityInvalid         bool
+	RangeUnsupported         bool
 }
 
 // NewHealth creates an empty tracker with no artificial preference.
@@ -72,6 +74,7 @@ func (health *Health) RecordSuccess(provider string, bytes int64, elapsed time.D
 	state.rateLimitedUntil = time.Time{}
 	state.authenticationInvalid = false
 	state.integrityInvalid = false
+	state.rangeUnsupported = false
 	health.states[provider] = state
 }
 
@@ -138,6 +141,13 @@ func (health *Health) RecordIntegrityViolation(provider string) {
 	health.recordUnavailable(provider, func(state *healthState) { state.integrityInvalid = true })
 }
 
+// RecordRangeUnsupported removes a Provider from blob selection when the
+// deployment explicitly requires resumable Range transfers. A future
+// successful admission probe restores it.
+func (health *Health) RecordRangeUnsupported(provider string) {
+	health.recordUnavailable(provider, func(state *healthState) { state.rangeUnsupported = true })
+}
+
 // RecordProviderFailure maps a typed upstream failure to its selection
 // consequence. It is shared by real transfers and active admission probes so
 // an idle Provider cannot remain falsely eligible after a known auth, content
@@ -167,6 +177,7 @@ func (health *Health) RecordProbeSuccess(provider string) {
 	state.rateLimitedUntil = time.Time{}
 	state.authenticationInvalid = false
 	state.integrityInvalid = false
+	state.rangeUnsupported = false
 	health.states[provider] = state
 }
 
@@ -201,6 +212,7 @@ func (health *Health) Snapshot() []HealthSnapshot {
 			RateLimitedUntil:         state.rateLimitedUntil,
 			AuthenticationInvalid:    state.authenticationInvalid,
 			IntegrityInvalid:         state.integrityInvalid,
+			RangeUnsupported:         state.rangeUnsupported,
 		})
 	}
 	sort.Slice(result, func(left, right int) bool {
@@ -237,6 +249,7 @@ func (health *Health) Restore(snapshots []HealthSnapshot) {
 		state.rateLimitedUntil = time.Time{}
 		state.authenticationInvalid = false
 		state.integrityInvalid = false
+		state.rangeUnsupported = false
 		health.states[snapshot.Provider] = state
 	}
 }
@@ -284,7 +297,7 @@ func (health *Health) available(provider string, now time.Time) bool {
 	health.mu.RLock()
 	state := health.states[provider]
 	health.mu.RUnlock()
-	return !state.authenticationInvalid && !state.integrityInvalid && !state.rateLimitedUntil.After(now)
+	return !state.authenticationInvalid && !state.integrityInvalid && !state.rangeUnsupported && !state.rateLimitedUntil.After(now)
 }
 
 func (health *Health) unavailableError(sources []Source, resolver bool) error {
@@ -303,7 +316,7 @@ func (health *Health) unavailableError(sources []Source, resolver bool) error {
 		}
 		hasCandidate = true
 		state := health.states[source.Name]
-		if !state.rateLimitedUntil.After(now) || state.authenticationInvalid || state.integrityInvalid {
+		if !state.rateLimitedUntil.After(now) || state.authenticationInvalid || state.integrityInvalid || state.rangeUnsupported {
 			allRateLimited = false
 			continue
 		}
