@@ -17,6 +17,7 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
 	"github.com/hjx/docker-registry-gateway/internal/lease"
+	"github.com/hjx/docker-registry-gateway/internal/routeguard"
 )
 
 func TestRunOnboardGuidesUserAndCreatesConfiguration(t *testing.T) {
@@ -283,6 +284,9 @@ providers:
 	probeDigest := fmt.Sprintf("sha256:%x", probeSum[:])
 	probeManifest := []byte(`{"schemaVersion":2,"config":{"digest":"` + probeDigest + `"}}`)
 	probeServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(routeguard.InstanceHeader) == "" || request.Header.Get(routeguard.HopHeader) == "" {
+			t.Error("provider admission probe omitted Gateway route-guard headers")
+		}
 		switch request.URL.Path {
 		case "/v2/":
 			response.WriteHeader(http.StatusOK)

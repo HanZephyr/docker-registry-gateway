@@ -350,7 +350,7 @@ func runProviderAdd(ctx context.Context, arguments []string, output, errorOutput
 		fmt.Fprintf(errorOutput, "Provider 配置无效，未进行准入探测: %v\n", err)
 		return 2
 	}
-	probeResult, err := probeProviderAdmission(ctx, provider, candidate.ProbeRef, candidate.AllowNonRangeProviders)
+	probeResult, err := probeProviderAdmissionWithGuard(ctx, provider, candidate.ProbeRef, candidate.AllowNonRangeProviders, routeguard.New(externalInstanceID(candidate.DataDir), 3))
 	if err != nil {
 		fmt.Fprintf(errorOutput, "Provider %s 准入探测失败，未写入配置: %v\n", provider.Name, err)
 		return 1
@@ -364,15 +364,20 @@ func runProviderAdd(ctx context.Context, arguments []string, output, errorOutput
 }
 
 func probeProviderAdmission(parent context.Context, configured config.Provider, probeRef string, allowNonRange bool) (provider.ProbeResult, error) {
+	return probeProviderAdmissionWithGuard(parent, configured, probeRef, allowNonRange, routeguard.Guard{})
+}
+
+func probeProviderAdmissionWithGuard(parent context.Context, configured config.Provider, probeRef string, allowNonRange bool, guard routeguard.Guard) (provider.ProbeResult, error) {
 	username, password, err := configured.Auth.Credentials()
 	if err != nil {
 		return provider.ProbeResult{}, fmt.Errorf("读取上游凭据: %w", err)
 	}
 	client, err := provider.New(provider.Options{
-		URL:      configured.URL,
-		Username: username,
-		Password: password,
-		CAFile:   configured.CAFile,
+		URL:        configured.URL,
+		Username:   username,
+		Password:   password,
+		CAFile:     configured.CAFile,
+		RouteGuard: guard,
 	})
 	if err != nil {
 		return provider.ProbeResult{}, err
@@ -628,7 +633,10 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintln(output, "TLS 提示：local_ca 已关闭且未配置 cert_file/key_file，Gateway 将使用纯 HTTP 后端监听。")
 	}
 	routeGuard := routeguard.New(instanceID, 3)
-	if err := requireRangeProviderAdmission(ctx, loaded, probeProviderAdmission); err != nil {
+	admitProvider := func(parent context.Context, configured config.Provider, probeRef string, allowNonRange bool) (provider.ProbeResult, error) {
+		return probeProviderAdmissionWithGuard(parent, configured, probeRef, allowNonRange, routeGuard)
+	}
+	if err := requireRangeProviderAdmission(ctx, loaded, admitProvider); err != nil {
 		fmt.Fprintf(errorOutput, "Provider Range 准入失败: %v\n", err)
 		return 1
 	}
@@ -826,7 +834,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			if err := requireRangeProviderAdmission(probeContext, candidate, probeProviderAdmission); err != nil {
+			if err := requireRangeProviderAdmission(probeContext, candidate, admitProvider); err != nil {
 				return fmt.Errorf("Provider Range 准入失败: %w", err)
 			}
 			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
@@ -1669,7 +1677,7 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 		for _, configured := range loaded.Providers {
 			probeContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 			username, password, credentialErr := configured.Auth.Credentials()
-			client, createErr := provider.New(provider.Options{URL: configured.URL, Username: username, Password: password, CAFile: configured.CAFile})
+			client, createErr := provider.New(provider.Options{URL: configured.URL, Username: username, Password: password, CAFile: configured.CAFile, RouteGuard: routeguard.New(externalInstanceID(loaded.DataDir), 3)})
 			if credentialErr == nil && createErr == nil {
 				result, probeErr := client.Probe(probeContext, loaded.ProbeRef)
 				cancel()
