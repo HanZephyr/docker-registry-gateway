@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -48,6 +49,24 @@ func TestReconcileCreatesTrustedLeafForConfiguredAndDesktopNames(t *testing.T) {
 
 	if _, err := os.Stat(result.IdentityPath); err != nil {
 		t.Errorf("identity file missing at %q: %v", result.IdentityPath, err)
+	}
+}
+
+func TestReconcileRejectsInsecureExistingRootPrivateKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs are not represented by POSIX file mode bits")
+	}
+	dataDir := t.TempDir()
+	options := localca.Options{DataDir: dataDir, AdvertiseEndpoint: "drg.localhost:5443"}
+	if _, err := localca.Reconcile(context.Background(), options); err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+	keyPath := filepath.Join(dataDir, "pki", "ca.key")
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatalf("chmod root key: %v", err)
+	}
+	if _, err := localca.Reconcile(context.Background(), options); err == nil {
+		t.Fatal("Reconcile() error = nil, want insecure CA key rejection")
 	}
 }
 

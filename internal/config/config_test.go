@@ -279,3 +279,69 @@ providers:
 		t.Fatalf("config.Load() error = %v, want listener overlap rejection", err)
 	}
 }
+
+func TestLoadFileResolvesExternalTLSCertificateAndKey(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "gateway.crt"), []byte("certificate"), 0o600); err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "gateway.key"), []byte("key"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	configPath := filepath.Join(directory, "drg.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: gateway.example.test:5443
+    cert_file: gateway.crt
+    key_file: gateway.key
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	loaded, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("config.LoadFile() error = %v", err)
+	}
+	if loaded.Server.TLS.LocalCA {
+		t.Error("local_ca = true, want explicit false")
+	}
+	if got, want := loaded.Server.TLS.CertFile, filepath.Join(directory, "gateway.crt"); got != want {
+		t.Errorf("cert_file = %q, want %q", got, want)
+	}
+	if got, want := loaded.Server.TLS.KeyFile, filepath.Join(directory, "gateway.key"); got != want {
+		t.Errorf("key_file = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsIncompleteExternalTLSConfiguration(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Load(strings.NewReader(`
+version: 1
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: gateway.example.test:5443
+    cert_file: gateway.crt
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`))
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file") {
+		t.Fatalf("config.Load() error = %v, want incomplete external TLS rejection", err)
+	}
+}

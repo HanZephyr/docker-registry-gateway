@@ -312,3 +312,57 @@ providers:
 		t.Fatal("serve did not stop after local control request")
 	}
 }
+
+func TestRunServeAllowsExplicitPlainHTTPBackend(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:0]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: unreachable
+    url: https://127.0.0.1:1
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+
+	var serveOutput, serveErrors bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- cli.Run(context.Background(), []string{"serve", "--config", configPath}, strings.NewReader(""), &serveOutput, &serveErrors)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := control.StatusRequest(context.Background(), dataDir); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("plain serve did not publish control endpoint: stderr=%s", serveErrors.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var output, errors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"stop", "--force", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("stop exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	select {
+	case exitCode := <-done:
+		if exitCode != 0 {
+			t.Fatalf("serve exit code = %d, stderr = %s", exitCode, serveErrors.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("plain serve did not stop")
+	}
+	if !strings.Contains(serveOutput.String(), "纯 HTTP") {
+		t.Errorf("serve output = %q, want explicit plain HTTP warning", serveOutput.String())
+	}
+}

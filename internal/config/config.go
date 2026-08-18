@@ -53,8 +53,11 @@ type Server struct {
 
 // TLS configures Gateway-facing transport security.
 type TLS struct {
-	LocalCA               bool   `yaml:"local_ca"`
+	LocalCA               bool   `yaml:"-"`
+	LocalCASpecified      *bool  `yaml:"local_ca"`
 	AdvertiseEndpoint     string `yaml:"advertise_endpoint"`
+	CertFile              string `yaml:"cert_file"`
+	KeyFile               string `yaml:"key_file"`
 	InstallTrust          bool   `yaml:"-"`
 	InstallTrustSpecified *bool  `yaml:"install_trust"`
 }
@@ -110,6 +113,9 @@ func (value Config) SecurityWarnings() []SecurityWarning {
 	}
 	if hasCredentials && hasNonLoopbackListener(value.Server.Listeners) {
 		warnings = append(warnings, SecurityWarning{Code: "credentialed_public_listener", Message: "Gateway 监听非回环地址且已配置 Provider 凭据；请确保网络边界和主机访问控制符合预期"})
+	}
+	if !value.Server.TLS.LocalCA && value.Server.TLS.CertFile == "" {
+		warnings = append(warnings, SecurityWarning{Code: "downstream_plain_http", Message: "Gateway 未启用本地 CA 且未配置 cert_file/key_file，将以纯 HTTP 后端监听；请确认 Docker daemon 已显式允许该不安全 Registry"})
 	}
 	return warnings
 }
@@ -190,6 +196,11 @@ func (value *Config) applyDefaults() {
 		value.Server.TLS.InstallTrust = true
 	} else {
 		value.Server.TLS.InstallTrust = *value.Server.TLS.InstallTrustSpecified
+	}
+	if value.Server.TLS.LocalCASpecified == nil {
+		value.Server.TLS.LocalCA = true
+	} else {
+		value.Server.TLS.LocalCA = *value.Server.TLS.LocalCASpecified
 	}
 	if value.Resolution.ConflictStrategy == "" {
 		value.Resolution.ConflictStrategy = "majority"
@@ -341,6 +352,12 @@ func validateServer(server Server) error {
 	}
 	if _, _, err := net.SplitHostPort(strings.TrimSpace(server.TLS.AdvertiseEndpoint)); err != nil {
 		return fmt.Errorf("invalid advertise_endpoint %q: %w", server.TLS.AdvertiseEndpoint, err)
+	}
+	if server.TLS.LocalCA && (strings.TrimSpace(server.TLS.CertFile) != "" || strings.TrimSpace(server.TLS.KeyFile) != "") {
+		return errors.New("cert_file and key_file require local_ca: false")
+	}
+	if !server.TLS.LocalCA && (strings.TrimSpace(server.TLS.CertFile) == "") != (strings.TrimSpace(server.TLS.KeyFile) == "") {
+		return errors.New("cert_file and key_file must be configured together")
 	}
 	return nil
 }
@@ -518,6 +535,18 @@ func (value Config) resolveFilePaths(baseDirectory string) (Config, error) {
 	resolved.DataDir = resolvePath(baseDirectory, resolved.DataDir)
 	if resolved.Resources.TempDir != "" {
 		resolved.Resources.TempDir = resolvePath(baseDirectory, resolved.Resources.TempDir)
+	}
+	if resolved.Server.TLS.CertFile != "" {
+		resolved.Server.TLS.CertFile = resolvePath(baseDirectory, resolved.Server.TLS.CertFile)
+		if err := validateReadableFile(resolved.Server.TLS.CertFile); err != nil {
+			return Config{}, fmt.Errorf("server tls cert_file: %w", err)
+		}
+	}
+	if resolved.Server.TLS.KeyFile != "" {
+		resolved.Server.TLS.KeyFile = resolvePath(baseDirectory, resolved.Server.TLS.KeyFile)
+		if err := validateReadableFile(resolved.Server.TLS.KeyFile); err != nil {
+			return Config{}, fmt.Errorf("server tls key_file: %w", err)
+		}
 	}
 	for index := range resolved.Providers {
 		provider := &resolved.Providers[index]

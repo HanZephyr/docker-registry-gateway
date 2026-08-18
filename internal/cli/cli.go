@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -99,8 +100,16 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 		return 1
 	}
 	if !loaded.Server.TLS.LocalCA {
-		fmt.Fprintln(errorOutput, "local_ca 已关闭，无法执行本地 CA 对账")
-		return 1
+		if loaded.Server.TLS.CertFile == "" {
+			fmt.Fprintln(output, "local_ca 已关闭且未配置外部证书；纯 HTTP 后端没有可对账的证书材料。")
+			return 0
+		}
+		if _, err := tls.LoadX509KeyPair(loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile); err != nil {
+			fmt.Fprintf(errorOutput, "外部 TLS 证书检查失败: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(output, "外部 TLS 证书可用：cert=%s，key=%s；本地 CA 对账不管理其续签或信任。\n", loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile)
+		return 0
 	}
 	result, err := reconcileTLS(ctx, loaded, *skipTrustInstall, output)
 	if err != nil {
@@ -158,27 +167,38 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
 		return 1
 	}
-	if !loaded.Server.TLS.LocalCA {
-		fmt.Fprintln(errorOutput, "当前首版 serve 仅支持 local_ca: true")
-		return 1
-	}
 	printSecurityWarnings(output, loaded)
 
 	absConfigPath, err := filepath.Abs(*configPath)
 	if err != nil {
 		absConfigPath = *configPath
 	}
-	tlsResult, err := reconcileTLS(ctx, loaded, false, output)
-	if err != nil {
-		fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", err)
-		return 1
+	var certificate *tls.Certificate
+	instanceID := externalInstanceID(loaded.DataDir)
+	if loaded.Server.TLS.LocalCA {
+		tlsResult, reconcileErr := reconcileTLS(ctx, loaded, false, output)
+		if reconcileErr != nil {
+			fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", reconcileErr)
+			return 1
+		}
+		loadedCertificate, loadErr := tls.LoadX509KeyPair(tlsResult.Certificate, tlsResult.PrivateKey)
+		if loadErr != nil {
+			fmt.Fprintf(errorOutput, "加载服务端证书失败: %v\n", loadErr)
+			return 1
+		}
+		certificate = &loadedCertificate
+		instanceID = tlsResult.InstanceID
+	} else if loaded.Server.TLS.CertFile != "" {
+		loadedCertificate, loadErr := tls.LoadX509KeyPair(loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile)
+		if loadErr != nil {
+			fmt.Fprintf(errorOutput, "加载外部服务端证书失败: %v\n", loadErr)
+			return 1
+		}
+		certificate = &loadedCertificate
+	} else {
+		fmt.Fprintln(output, "TLS 提示：local_ca 已关闭且未配置 cert_file/key_file，Gateway 将使用纯 HTTP 后端监听。")
 	}
-	certificate, err := tls.LoadX509KeyPair(tlsResult.Certificate, tlsResult.PrivateKey)
-	if err != nil {
-		fmt.Fprintf(errorOutput, "加载服务端证书失败: %v\n", err)
-		return 1
-	}
-	routeGuard := routeguard.New(tlsResult.InstanceID, 3)
+	routeGuard := routeguard.New(instanceID, 3)
 
 	tracker := router.NewHealth()
 	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now)
@@ -221,7 +241,9 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 				_ = events.Write(eventlog.Event{Level: event.Level, Code: event.Code, Message: event.Message})
 			},
 		}), loaded.Resources.MaxInflightRequests),
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12},
+	}
+	if certificate != nil {
+		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*certificate}, MinVersion: tls.VersionTLS12}
 	}
 
 	listeners := make([]net.Listener, 0, len(loaded.Server.Listeners))
@@ -234,7 +256,10 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			fmt.Fprintf(errorOutput, "监听 %s 失败: %v\n", address, err)
 			return 1
 		}
-		listeners = append(listeners, tls.NewListener(listener, server.TLSConfig))
+		if server.TLSConfig != nil {
+			listener = tls.NewListener(listener, server.TLSConfig)
+		}
+		listeners = append(listeners, listener)
 	}
 	listenersForStatus := append([]string(nil), loaded.Server.Listeners...)
 	currentConfig := loaded
@@ -532,6 +557,8 @@ func sameServeConfiguration(current, candidate config.Config) bool {
 	if current.DataDir != candidate.DataDir ||
 		current.Server.TLS.LocalCA != candidate.Server.TLS.LocalCA ||
 		current.Server.TLS.AdvertiseEndpoint != candidate.Server.TLS.AdvertiseEndpoint ||
+		current.Server.TLS.CertFile != candidate.Server.TLS.CertFile ||
+		current.Server.TLS.KeyFile != candidate.Server.TLS.KeyFile ||
 		len(current.Server.Listeners) != len(candidate.Server.Listeners) {
 		return false
 	}
@@ -541,6 +568,11 @@ func sameServeConfiguration(current, candidate config.Config) bool {
 		}
 	}
 	return true
+}
+
+func externalInstanceID(dataDir string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(dataDir)))
+	return fmt.Sprintf("drg:%x", sum[:])
 }
 
 func admissionConfigurationChanged(current, candidate config.Config) bool {
@@ -944,12 +976,18 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 }
 
 func diagnoseTLS(loaded config.Config, output io.Writer) error {
-	if !loaded.Server.TLS.LocalCA {
-		return errors.New("local_ca 已关闭，首版服务不支持")
+	if !loaded.Server.TLS.LocalCA && loaded.Server.TLS.CertFile == "" {
+		fmt.Fprintln(output, "TLS：纯 HTTP 后端（未配置 local_ca 或外部 cert_file/key_file）")
+		return nil
 	}
-	certificatePath := filepath.Join(loaded.DataDir, "pki", "server.crt")
-	keyPath := filepath.Join(loaded.DataDir, "pki", "server.key")
-	caPath := filepath.Join(loaded.DataDir, "pki", "ca.crt")
+	certificatePath := loaded.Server.TLS.CertFile
+	keyPath := loaded.Server.TLS.KeyFile
+	caPath := ""
+	if loaded.Server.TLS.LocalCA {
+		certificatePath = filepath.Join(loaded.DataDir, "pki", "server.crt")
+		keyPath = filepath.Join(loaded.DataDir, "pki", "server.key")
+		caPath = filepath.Join(loaded.DataDir, "pki", "ca.crt")
+	}
 	if _, err := tls.LoadX509KeyPair(certificatePath, keyPath); err != nil {
 		return err
 	}
@@ -968,10 +1006,14 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	if time.Until(certificate.NotAfter) <= 0 {
 		return errors.New("服务端证书已过期")
 	}
-	if _, err := os.Stat(caPath); err != nil {
-		return err
+	if caPath != "" {
+		if _, err := os.Stat(caPath); err != nil {
+			return err
+		}
+		fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；本地 CA=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), caPath)
+	} else {
+		fmt.Fprintf(output, "TLS：正常（外部叶证书到期时间 %s；cert=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), certificatePath)
 	}
-	fmt.Fprintf(output, "TLS：正常（叶证书到期时间 %s；CA=%s）\n", certificate.NotAfter.Local().Format(time.RFC3339), caPath)
 	return nil
 }
 

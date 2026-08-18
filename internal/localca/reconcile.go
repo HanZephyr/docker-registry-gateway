@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -152,6 +153,9 @@ func loadOrCreateRoot(certificatePath, keyPath, identityPath string, now time.Ti
 	if !certificate.IsCA {
 		return nil, nil, false, errors.New("stored local CA certificate is not a certificate authority")
 	}
+	if err := verifyPrivateKeyPermissions(keyPath); err != nil {
+		return nil, nil, false, err
+	}
 	key, err := readECPrivateKey(keyPath)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("read local CA private key: %w", err)
@@ -163,6 +167,23 @@ func loadOrCreateRoot(certificatePath, keyPath, identityPath string, now time.Ti
 		return nil, nil, false, err
 	}
 	return certificate, key, false, nil
+}
+
+func verifyPrivateKeyPermissions(path string) error {
+	if runtime.GOOS == "windows" {
+		// Windows access is protected by the containing data-directory ACL. The
+		// file is always created through atomicWrite with owner-only intent; the
+		// platform-specific ACL inspection is handled by the deployment doctor.
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return errors.New("local CA private key permissions allow group or other access")
+	}
+	return nil
 }
 
 func createRoot(now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {
