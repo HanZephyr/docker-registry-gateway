@@ -1,0 +1,354 @@
+package router
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+
+	"github.com/hjx/docker-registry-gateway/internal/registry"
+)
+
+const segmentOverlap int64 = 64 << 10
+
+// TempBudget prevents concurrent pulls from filling the temporary filesystem.
+// It is intentionally process-local: DRG does not coordinate or merge work
+// across clients.
+type TempBudget struct {
+	mu    sync.Mutex
+	limit int64
+	used  int64
+}
+
+// NewTempBudget creates a shared temporary-file reservation budget.
+func NewTempBudget(limit int64) *TempBudget {
+	return &TempBudget{limit: limit}
+}
+
+func (budget *TempBudget) acquire(bytes int64) (func(), bool) {
+	if budget == nil || bytes <= 0 {
+		return func() {}, budget == nil
+	}
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+	if budget.limit <= 0 || bytes > budget.limit-budget.used {
+		return nil, false
+	}
+	budget.used += bytes
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			budget.mu.Lock()
+			budget.used -= bytes
+			budget.mu.Unlock()
+		})
+	}, true
+}
+
+func (router *Router) trySegmentedBlob(ctx context.Context, repository, digest string) (registry.Blob, bool) {
+	if router.maxSegmentsPerBlob < 2 || router.minSegmentSize <= 0 || router.tempBudget == nil {
+		return registry.Blob{}, false
+	}
+	metadata, err := router.openBlob(ctx, repository, digest, "bytes=0-0")
+	if err != nil {
+		return registry.Blob{}, false
+	}
+	_ = metadata.Reader.Close()
+	segments := planSegments(metadata.Size, router.maxSegmentsPerBlob, router.minSegmentSize)
+	if len(segments) < 2 {
+		return registry.Blob{}, false
+	}
+	reserve := segmentStorageBytes(segments)
+	release, acquired := router.tempBudget.acquire(reserve)
+	if !acquired {
+		return registry.Blob{}, false
+	}
+	reader, err := router.startSegmentDownloads(ctx, repository, digest, metadata.Size, segments, release)
+	if err != nil {
+		release()
+		return registry.Blob{}, false
+	}
+	return registry.Blob{Digest: digest, Size: metadata.Size, Start: 0, End: metadata.Size - 1, Reader: reader}, true
+}
+
+type segment struct {
+	start         int64
+	end           int64
+	physicalStart int64
+	path          string
+}
+
+func planSegments(size int64, maximum int, minimumSize int64) []segment {
+	if size <= 0 || maximum < 2 || minimumSize <= 0 || minimumSize > size/2 {
+		return nil
+	}
+	requested := (size-1)/minimumSize + 1
+	count := maximum
+	if requested < int64(maximum) {
+		count = int(requested)
+	}
+	if count < 2 {
+		return nil
+	}
+	segments := make([]segment, count)
+	for index := range segments {
+		start := int64(index) * size / int64(count)
+		end := int64(index+1)*size/int64(count) - 1
+		physicalStart := start
+		if index > 0 {
+			overlap := segmentOverlap
+			if overlap > start {
+				overlap = start
+			}
+			physicalStart -= overlap
+		}
+		segments[index] = segment{start: start, end: end, physicalStart: physicalStart}
+	}
+	return segments
+}
+
+func segmentStorageBytes(segments []segment) int64 {
+	var total int64
+	for _, segment := range segments {
+		length := segment.end - segment.physicalStart + 1
+		if length <= 0 || total > (1<<63-1)-length {
+			return 0
+		}
+		total += length
+	}
+	return total
+}
+
+func (router *Router) startSegmentDownloads(parent context.Context, repository, digest string, size int64, segments []segment, release func()) (*segmentedReader, error) {
+	directory := router.temporaryDir
+	if directory == "" {
+		directory = os.TempDir()
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, err
+	}
+	downloadContext, cancel := context.WithCancel(parent)
+	ready := make([]chan error, len(segments))
+	done := make(chan struct{})
+	reader := &segmentedReader{segments: segments, ready: ready, done: done, cancel: cancel, release: release}
+	var group sync.WaitGroup
+	for index := range segments {
+		ready[index] = make(chan error, 1)
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			err := router.downloadSegment(downloadContext, repository, digest, size, &segments[index], directory)
+			if err != nil {
+				cancel()
+			}
+			ready[index] <- err
+			close(ready[index])
+		}(index)
+	}
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	return reader, nil
+}
+
+func (router *Router) downloadSegment(ctx context.Context, repository, digest string, size int64, target *segment, directory string) error {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", target.physicalStart, target.end)
+	blob, err := router.openBlob(ctx, repository, digest, rangeHeader)
+	if err != nil {
+		return err
+	}
+	defer blob.Reader.Close()
+	if blob.Size != size || blob.Start != target.physicalStart || blob.End != target.end {
+		return errors.New("Provider returned an unexpected segment range")
+	}
+	file, err := os.CreateTemp(directory, ".drg-segment-*")
+	if err != nil {
+		return err
+	}
+	target.path = file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(target.path)
+		return err
+	}
+	expected := target.end - target.physicalStart + 1
+	count, copyErr := io.Copy(file, io.LimitReader(blob.Reader, expected))
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil || count != expected {
+		_ = os.Remove(target.path)
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func verifySegmentOverlap(leftSegment, rightSegment segment) error {
+	overlap := rightSegment.start - rightSegment.physicalStart
+	if overlap == 0 {
+		return nil
+	}
+	left, err := os.Open(leftSegment.path)
+	if err != nil {
+		return err
+	}
+	right, openErr := os.Open(rightSegment.path)
+	if openErr != nil {
+		_ = left.Close()
+		return openErr
+	}
+	leftOffset := rightSegment.physicalStart - leftSegment.physicalStart
+	err = compareRanges(left, leftOffset, right, 0, overlap)
+	leftCloseErr := left.Close()
+	rightCloseErr := right.Close()
+	if err != nil {
+		return err
+	}
+	if leftCloseErr != nil {
+		return leftCloseErr
+	}
+	return rightCloseErr
+}
+
+func compareRanges(left *os.File, leftOffset int64, right *os.File, rightOffset int64, length int64) error {
+	leftBuffer := make([]byte, 32<<10)
+	rightBuffer := make([]byte, len(leftBuffer))
+	for length > 0 {
+		chunk := int64(len(leftBuffer))
+		if chunk > length {
+			chunk = length
+		}
+		if _, err := left.ReadAt(leftBuffer[:chunk], leftOffset); err != nil {
+			return err
+		}
+		if _, err := right.ReadAt(rightBuffer[:chunk], rightOffset); err != nil {
+			return err
+		}
+		for index := int64(0); index < chunk; index++ {
+			if leftBuffer[index] != rightBuffer[index] {
+				return errors.New("Provider segment overlap does not match")
+			}
+		}
+		leftOffset += chunk
+		rightOffset += chunk
+		length -= chunk
+	}
+	return nil
+}
+
+type segmentedReader struct {
+	segments  []segment
+	ready     []chan error
+	done      <-chan struct{}
+	cancel    context.CancelFunc
+	current   int
+	file      *os.File
+	remaining int64
+	release   func()
+	once      sync.Once
+}
+
+func (reader *segmentedReader) Read(buffer []byte) (int, error) {
+	for {
+		if reader.current >= len(reader.segments) {
+			reader.cleanup()
+			return 0, io.EOF
+		}
+		if reader.file == nil {
+			if err := <-reader.ready[reader.current]; err != nil {
+				reader.cleanup()
+				return 0, err
+			}
+			segment := reader.segments[reader.current]
+			if reader.current > 0 {
+				if err := verifySegmentOverlap(reader.segments[reader.current-1], segment); err != nil {
+					reader.cleanup()
+					return 0, err
+				}
+			}
+			file, err := os.Open(segment.path)
+			if err != nil {
+				reader.cleanup()
+				return 0, err
+			}
+			if _, err := file.Seek(segment.start-segment.physicalStart, io.SeekStart); err != nil {
+				_ = file.Close()
+				reader.cleanup()
+				return 0, err
+			}
+			reader.file = file
+			reader.remaining = segment.end - segment.start + 1
+		}
+		if reader.remaining == 0 {
+			reader.closeCurrent()
+			reader.current++
+			continue
+		}
+		limit := len(buffer)
+		if int64(limit) > reader.remaining {
+			limit = int(reader.remaining)
+		}
+		count, err := reader.file.Read(buffer[:limit])
+		reader.remaining -= int64(count)
+		if err != nil && !errors.Is(err, io.EOF) {
+			reader.cleanup()
+			return count, err
+		}
+		if reader.remaining == 0 {
+			reader.closeCurrent()
+			reader.current++
+			if count > 0 {
+				return count, nil
+			}
+			continue
+		}
+		if count > 0 {
+			return count, nil
+		}
+		reader.cleanup()
+		return 0, io.ErrUnexpectedEOF
+	}
+}
+
+func (reader *segmentedReader) Close() error {
+	reader.cleanup()
+	return nil
+}
+
+func (reader *segmentedReader) closeCurrent() {
+	if reader.file != nil {
+		_ = reader.file.Close()
+		reader.file = nil
+	}
+}
+
+func (reader *segmentedReader) cleanup() {
+	reader.once.Do(func() {
+		if reader.cancel != nil {
+			reader.cancel()
+		}
+		if reader.done != nil {
+			<-reader.done
+		}
+		reader.closeCurrent()
+		removeSegments(reader.segments)
+		if reader.release != nil {
+			reader.release()
+		}
+	})
+}
+
+func removeSegments(segments []segment) {
+	for _, segment := range segments {
+		if segment.path != "" {
+			_ = os.Remove(segment.path)
+		}
+	}
+}

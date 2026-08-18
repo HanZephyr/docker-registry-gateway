@@ -176,7 +176,13 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	} else {
 		tracker.Restore(snapshots)
 	}
-	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker)
+	temporaryDiskQuota, err := config.ParseByteSize(loaded.Resources.TemporaryDiskQuota)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取临时磁盘配额失败: %v\n", err)
+		return 1
+	}
+	tempBudget := router.NewTempBudget(temporaryDiskQuota)
+	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
@@ -272,8 +278,8 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			if err != nil {
 				return fmt.Errorf("读取或校验新配置: %w", err)
 			}
-			if !sameServeConfiguration(currentConfig, candidate) || admissionConfigurationChanged(currentConfig, candidate) {
-				return errors.New("监听地址、访问地址、TLS 模式、data_dir 或请求并发上限已改变，需要使用 drg restart")
+			if !sameServeConfiguration(currentConfig, candidate) || resourceConfigurationChanged(currentConfig, candidate) {
+				return errors.New("监听地址、访问地址、TLS 模式、data_dir 或资源上限已改变，需要使用 drg restart")
 			}
 			if resolverConfigurationChanged(currentConfig, candidate) {
 				store, storeErr := lease.Open(filepath.Join(currentConfig.DataDir, "decision-leases.json"), time.Now())
@@ -283,7 +289,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 					}
 				}
 			}
-			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker)
+			replacement, err := buildRouter(candidate, []byte(absConfigPath), tracker, tempBudget)
 			if err != nil {
 				return err
 			}
@@ -393,7 +399,7 @@ func (writer *lockedWriter) Write(contents []byte) (int, error) {
 	return writer.writer.Write(contents)
 }
 
-func buildRouter(loaded config.Config, salt []byte, tracker *router.Health) (*router.Router, error) {
+func buildRouter(loaded config.Config, salt []byte, tracker *router.Health, tempBudget *router.TempBudget) (*router.Router, error) {
 	sources := make([]router.Source, 0, len(loaded.Providers))
 	for _, configured := range loaded.Providers {
 		username, password, err := configured.Auth.Credentials()
@@ -421,6 +427,10 @@ func buildRouter(loaded config.Config, salt []byte, tracker *router.Health) (*ro
 	if err != nil {
 		return nil, fmt.Errorf("读取无 Range 重拉预算: %w", err)
 	}
+	minSegmentSize, err := config.ParseByteSize(loaded.Resources.MinSegmentSize)
+	if err != nil {
+		return nil, fmt.Errorf("读取最小分片大小: %w", err)
+	}
 	decisionLease, err := time.ParseDuration(loaded.Resolution.DecisionLease)
 	if err != nil {
 		return nil, fmt.Errorf("读取解析租约时长: %w", err)
@@ -441,6 +451,10 @@ func buildRouter(loaded config.Config, salt []byte, tracker *router.Health) (*ro
 		DecisionLease:            decisionLease,
 		LeaseStore:               leaseStore,
 		Health:                   tracker,
+		MaxSegmentsPerBlob:       loaded.Resources.MaxSegmentsPerBlob,
+		MinSegmentSize:           minSegmentSize,
+		TemporaryDir:             loaded.Resources.TempDir,
+		TempBudget:               tempBudget,
 	}), nil
 }
 
@@ -499,6 +513,15 @@ func admissionConfigurationChanged(current, candidate config.Config) bool {
 	return current.Resources.MaxConcurrentPulls != candidate.Resources.MaxConcurrentPulls ||
 		current.Resources.MaxInflightRequests != candidate.Resources.MaxInflightRequests ||
 		current.Resources.MaxQueuedPulls != candidate.Resources.MaxQueuedPulls
+}
+
+func resourceConfigurationChanged(current, candidate config.Config) bool {
+	return admissionConfigurationChanged(current, candidate) ||
+		current.Resources.MaxSegmentsPerBlob != candidate.Resources.MaxSegmentsPerBlob ||
+		current.Resources.TemporaryDiskQuota != candidate.Resources.TemporaryDiskQuota ||
+		current.Resources.MinSegmentSize != candidate.Resources.MinSegmentSize ||
+		current.Resources.MaxNoRangeRestartDiscard != candidate.Resources.MaxNoRangeRestartDiscard ||
+		current.Resources.TempDir != candidate.Resources.TempDir
 }
 
 func runStatus(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {

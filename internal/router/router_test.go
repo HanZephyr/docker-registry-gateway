@@ -1,10 +1,15 @@
 package router_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -162,6 +167,109 @@ func TestBlobAvoidsRecentlyFailingProvider(t *testing.T) {
 	}
 }
 
+func TestBlobDownloadsLargeFullRangeInTemporarySegments(t *testing.T) {
+	t.Parallel()
+
+	contents := bytes.Repeat([]byte("0123456789abcdef"), 16<<10)
+	temporaryDir := filepath.Join(t.TempDir(), "segments")
+	backend := &rangeBackend{contents: contents}
+	gateway := router.New([]router.Source{{Name: "range", PullProvider: true, Backend: backend}}, router.Options{
+		MaxSegmentsPerBlob: 3,
+		MinSegmentSize:     64 << 10,
+		TemporaryDir:       temporaryDir,
+		TempBudget:         router.NewTempBudget(int64(len(contents)) * 2),
+	})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	got, err := io.ReadAll(blob.Reader)
+	if err != nil {
+		t.Fatalf("read segmented blob: %v", err)
+	}
+	if err := blob.Reader.Close(); err != nil {
+		t.Fatalf("close segmented blob: %v", err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Fatal("segmented blob contents do not match the source")
+	}
+	if entries, err := os.ReadDir(temporaryDir); err != nil {
+		t.Fatalf("read temporary directory: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("temporary segment entries = %d, want cleanup after read", len(entries))
+	}
+	if calls := backend.rangeCalls(); len(calls) < 3 || calls[0] != "bytes=0-0" {
+		t.Errorf("range calls = %#v, want metadata probe and multiple segments", calls)
+	}
+}
+
+func TestBlobAbortsWhenSegmentOverlapDisagrees(t *testing.T) {
+	t.Parallel()
+
+	contents := bytes.Repeat([]byte("0123456789abcdef"), 16<<10)
+	backend := &rangeBackend{contents: contents, corruptNonZeroRange: true}
+	gateway := router.New([]router.Source{{Name: "range", PullProvider: true, Backend: backend}}, router.Options{
+		MaxSegmentsPerBlob: 3,
+		MinSegmentSize:     64 << 10,
+		TemporaryDir:       filepath.Join(t.TempDir(), "segments"),
+		TempBudget:         router.NewTempBudget(int64(len(contents)) * 2),
+	})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+	if _, err := io.ReadAll(blob.Reader); err == nil {
+		t.Fatal("read segmented blob error = nil, want overlap verification failure")
+	}
+	for _, call := range backend.rangeCalls() {
+		if call == "" {
+			t.Errorf("range calls = %#v, must not silently switch to a potentially different full stream", backend.rangeCalls())
+			break
+		}
+	}
+}
+
+func TestBlobStreamsFirstCompletedSegmentBeforeLaterSegmentsFinish(t *testing.T) {
+	t.Parallel()
+
+	contents := bytes.Repeat([]byte("0123456789abcdef"), 16<<10)
+	blockLaterSegments := make(chan struct{})
+	backend := &rangeBackend{contents: contents, blockNonFirstRange: blockLaterSegments}
+	gateway := router.New([]router.Source{{Name: "range", PullProvider: true, Backend: backend}}, router.Options{
+		MaxSegmentsPerBlob: 3,
+		MinSegmentSize:     64 << 10,
+		TemporaryDir:       filepath.Join(t.TempDir(), "segments"),
+		TempBudget:         router.NewTempBudget(int64(len(contents)) * 2),
+	})
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+
+	firstRead := make(chan error, 1)
+	buffer := make([]byte, 1024)
+	go func() {
+		count, readErr := blob.Reader.Read(buffer)
+		if count == 0 && readErr == nil {
+			readErr = errors.New("first segment produced no bytes")
+		}
+		firstRead <- readErr
+	}()
+	select {
+	case readErr := <-firstRead:
+		if readErr != nil {
+			t.Fatalf("first segment read: %v", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first segment waited for later segments before yielding bytes")
+	}
+	close(blockLaterSegments)
+}
+
 func TestBlobResumesFromNextRangeProviderAfterInterruptedRead(t *testing.T) {
 	t.Parallel()
 
@@ -313,3 +421,66 @@ func (reader *failingReadCloser) Read(buffer []byte) (int, error) {
 }
 
 func (*failingReadCloser) Close() error { return nil }
+
+type rangeBackend struct {
+	mu                  sync.Mutex
+	contents            []byte
+	calls               []string
+	corruptNonZeroRange bool
+	blockNonFirstRange  <-chan struct{}
+}
+
+func (*rangeBackend) Manifest(context.Context, string, string, []string) (registry.Manifest, error) {
+	return registry.Manifest{}, registry.ErrNotFound
+}
+
+func (backend *rangeBackend) Blob(ctx context.Context, _ string, digest, rangeHeader string) (registry.Blob, error) {
+	backend.mu.Lock()
+	backend.calls = append(backend.calls, rangeHeader)
+	backend.mu.Unlock()
+	start, end, err := parseTestRange(rangeHeader, int64(len(backend.contents)))
+	if err != nil {
+		return registry.Blob{}, err
+	}
+	if backend.blockNonFirstRange != nil && rangeHeader != "" && start > 0 {
+		select {
+		case <-backend.blockNonFirstRange:
+		case <-ctx.Done():
+			return registry.Blob{}, ctx.Err()
+		}
+	}
+	responseContents := append([]byte(nil), backend.contents[start:end+1]...)
+	if backend.corruptNonZeroRange && rangeHeader != "" && start > 0 && len(responseContents) > 0 {
+		responseContents[0] ^= 0xff
+	}
+	return registry.Blob{
+		Digest: digest,
+		Size:   int64(len(backend.contents)),
+		Start:  start,
+		End:    end,
+		Reader: io.NopCloser(bytes.NewReader(responseContents)),
+	}, nil
+}
+
+func (backend *rangeBackend) rangeCalls() []string {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]string(nil), backend.calls...)
+}
+
+func parseTestRange(header string, size int64) (int64, int64, error) {
+	if header == "" {
+		return 0, size - 1, nil
+	}
+	value := strings.TrimPrefix(header, "bytes=")
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("invalid test range")
+	}
+	start, startErr := strconv.ParseInt(parts[0], 10, 64)
+	end, endErr := strconv.ParseInt(parts[1], 10, 64)
+	if startErr != nil || endErr != nil || start < 0 || end < start || end >= size {
+		return 0, 0, errors.New("invalid test range")
+	}
+	return start, end, nil
+}

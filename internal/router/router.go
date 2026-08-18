@@ -31,6 +31,10 @@ type Options struct {
 	TieBreaker               string
 	Salt                     []byte
 	Health                   *Health
+	MaxSegmentsPerBlob       int
+	MinSegmentSize           int64
+	TemporaryDir             string
+	TempBudget               *TempBudget
 	NoRangeRestartEnabled    *bool
 	MaxNoRangeRestartDiscard int64
 	DecisionLease            time.Duration
@@ -48,6 +52,10 @@ type Router struct {
 	decisionLease            time.Duration
 	leaseStore               *lease.Store
 	health                   *Health
+	maxSegmentsPerBlob       int
+	minSegmentSize           int64
+	temporaryDir             string
+	tempBudget               *TempBudget
 }
 
 // New creates a Router. Configuration validation guarantees sources contain
@@ -73,6 +81,10 @@ func New(sources []Source, options Options) *Router {
 	if health == nil {
 		health = NewHealth()
 	}
+	maxSegments := options.MaxSegmentsPerBlob
+	if maxSegments < 1 {
+		maxSegments = 1
+	}
 	return &Router{
 		sources:                  append([]Source(nil), sources...),
 		conflictStrategy:         conflictStrategy,
@@ -83,6 +95,10 @@ func New(sources []Source, options Options) *Router {
 		decisionLease:            options.DecisionLease,
 		leaseStore:               options.LeaseStore,
 		health:                   health,
+		maxSegmentsPerBlob:       maxSegments,
+		minSegmentSize:           options.MinSegmentSize,
+		temporaryDir:             options.TemporaryDir,
+		tempBudget:               options.TempBudget,
 	}
 }
 
@@ -282,6 +298,15 @@ func (router *Router) breakTie(repository, reference string, accepts []string, c
 // prematurely, its reader resumes from an untried Provider with a Range that
 // starts exactly after the bytes already delivered downstream.
 func (router *Router) Blob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
+	if rangeHeader == "" {
+		if blob, segmented := router.trySegmentedBlob(ctx, repository, digest); segmented {
+			return blob, nil
+		}
+	}
+	return router.openBlob(ctx, repository, digest, rangeHeader)
+}
+
+func (router *Router) openBlob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
 	allNotFound := true
 	attempted := make(map[int]bool)
 	for _, index := range router.health.orderedPullSourceIndexes(router.sources) {
