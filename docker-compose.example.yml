@@ -1,0 +1,12 @@
+services:
+  drg:
+    build:
+      context: .
+    image: docker-registry-gateway:local
+    command: ["serve", "--config", "/etc/drg/drg.yaml"]
+    ports:
+      - "5443:5443"
+    volumes:
+      - ./drg.yaml:/etc/drg/drg.yaml:ro
+      - ./.drg:/var/lib/drg
+    restart: unless-stopped
