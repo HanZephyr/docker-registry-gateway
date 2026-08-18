@@ -31,6 +31,8 @@ const (
 	serverKey           = "server.key"
 	identityFile        = "identity.json"
 	previousRootFile    = "ca.previous.crt"
+	pendingRootFile     = "ca.next.crt"
+	pendingRootKeyFile  = "ca.next.key"
 
 	leafValidity = 90 * 24 * time.Hour
 	renewBefore  = 30 * 24 * time.Hour
@@ -53,6 +55,8 @@ type Result struct {
 	InstanceID     string
 	CAPath         string
 	PreviousCAPath string
+	PendingCAPath  string
+	PendingKeyPath string
 	Certificate    string
 	PrivateKey     string
 	IdentityPath   string
@@ -88,6 +92,8 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 	result := Result{
 		CAPath:         filepath.Join(pkiDirectory, rootCertificateFile),
 		PreviousCAPath: filepath.Join(pkiDirectory, previousRootFile),
+		PendingCAPath:  filepath.Join(pkiDirectory, pendingRootFile),
+		PendingKeyPath: filepath.Join(pkiDirectory, pendingRootKeyFile),
 		Certificate:    filepath.Join(pkiDirectory, serverCertificate),
 		PrivateKey:     filepath.Join(pkiDirectory, serverKey),
 		IdentityPath:   filepath.Join(pkiDirectory, identityFile),
@@ -115,11 +121,12 @@ func Reconcile(ctx context.Context, options Options) (Result, error) {
 	return result, nil
 }
 
-// RotateRoot explicitly replaces the durable local CA while retaining the
-// previous public root next to it. Callers install both roots into Docker
-// trust before restarting a running Gateway, so its currently served leaf is
-// not suddenly distrusted during the transition.
-func RotateRoot(ctx context.Context, options Options) (Result, error) {
+// PrepareRootRotation creates a pending replacement root without changing the
+// root that the running Gateway (and Docker clients) currently trust. Callers
+// must install PendingCAPath into Docker trust before calling
+// ActivateRootRotation. Keeping this explicit makes a failed trust installation
+// incapable of activating an untrusted server leaf.
+func PrepareRootRotation(ctx context.Context, options Options) (Result, error) {
 	result, err := Reconcile(ctx, options)
 	if err != nil {
 		return Result{}, err
@@ -131,37 +138,120 @@ func RotateRoot(ctx context.Context, options Options) (Result, error) {
 	if options.Now != nil {
 		now = options.Now().UTC()
 	}
-	currentRoot, _, _, err := loadOrCreateRoot(result.CAPath, filepath.Join(filepath.Dir(result.CAPath), rootKeyFile), result.IdentityPath, now)
-	if err != nil {
-		return Result{}, err
+	if fileExists(result.PreviousCAPath) {
+		return Result{}, errors.New("the previous local CA is still retained; explicitly clear it before preparing another root rotation")
 	}
-	if err := writeCertificate(result.PreviousCAPath, currentRoot); err != nil {
-		return Result{}, fmt.Errorf("preserve previous local CA certificate: %w", err)
+	pendingCertificateExists := fileExists(result.PendingCAPath)
+	pendingKeyExists := fileExists(result.PendingKeyPath)
+	if pendingCertificateExists != pendingKeyExists {
+		return Result{}, errors.New("pending local CA certificate and private key must either both exist or both be absent")
+	}
+	if pendingCertificateExists {
+		pendingRoot, err := readCertificate(result.PendingCAPath)
+		if err != nil || !pendingRoot.IsCA {
+			return Result{}, errors.New("pending local CA certificate is invalid")
+		}
+		if err := verifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
+			return Result{}, err
+		}
+		if _, err := readECPrivateKey(result.PendingKeyPath); err != nil {
+			return Result{}, fmt.Errorf("read pending local CA private key: %w", err)
+		}
+		return result, nil
 	}
 	newRoot, newKey, err := createRoot(now)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := writeCertificate(result.CAPath, newRoot); err != nil {
+	if err := writeCertificate(result.PendingCAPath, newRoot); err != nil {
+		return Result{}, fmt.Errorf("write pending local CA certificate: %w", err)
+	}
+	if err := writeECPrivateKey(result.PendingKeyPath, newKey); err != nil {
+		_ = os.Remove(result.PendingCAPath)
+		return Result{}, fmt.Errorf("write pending local CA private key: %w", err)
+	}
+	return result, nil
+}
+
+// ActivateRootRotation atomically promotes a prepared root after its public
+// certificate has been trusted by Docker. The existing root is retained as
+// ca.previous.crt and may only be removed through ClearPreviousRoot.
+func ActivateRootRotation(ctx context.Context, options Options) (Result, error) {
+	result, err := Reconcile(ctx, options)
+	if err != nil {
 		return Result{}, err
 	}
-	if err := writeECPrivateKey(filepath.Join(filepath.Dir(result.CAPath), rootKeyFile), newKey); err != nil {
+	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	if err := writeIdentity(result.IdentityPath, newRoot); err != nil {
+	if fileExists(result.PreviousCAPath) {
+		return Result{}, errors.New("the previous local CA is still retained; explicitly clear it before activating another root rotation")
+	}
+	if !fileExists(result.PendingCAPath) || !fileExists(result.PendingKeyPath) {
+		return Result{}, errors.New("no prepared local CA rotation exists; run tls rotate-root first")
+	}
+	pendingRoot, err := readCertificate(result.PendingCAPath)
+	if err != nil || !pendingRoot.IsCA {
+		return Result{}, errors.New("pending local CA certificate is invalid")
+	}
+	if err := verifyPrivateKeyPermissions(result.PendingKeyPath); err != nil {
 		return Result{}, err
+	}
+	pendingKey, err := readECPrivateKey(result.PendingKeyPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("read pending local CA private key: %w", err)
+	}
+	currentRoot, err := readCertificate(result.CAPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("read current local CA certificate: %w", err)
+	}
+	if err := writeCertificate(result.PreviousCAPath, currentRoot); err != nil {
+		return Result{}, fmt.Errorf("preserve previous local CA certificate: %w", err)
+	}
+	if err := writeCertificate(result.CAPath, pendingRoot); err != nil {
+		return Result{}, fmt.Errorf("activate pending local CA certificate: %w", err)
+	}
+	if err := writeECPrivateKey(filepath.Join(filepath.Dir(result.CAPath), rootKeyFile), pendingKey); err != nil {
+		return Result{}, fmt.Errorf("activate pending local CA private key: %w", err)
+	}
+	if err := writeIdentity(result.IdentityPath, pendingRoot); err != nil {
+		return Result{}, fmt.Errorf("activate local CA identity: %w", err)
+	}
+	now := time.Now().UTC()
+	if options.Now != nil {
+		now = options.Now().UTC()
 	}
 	host, _, err := splitEndpoint(options.AdvertiseEndpoint)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := issueLeaf(result.Certificate, result.PrivateKey, newRoot, newKey, host, now); err != nil {
+	if err := issueLeaf(result.Certificate, result.PrivateKey, pendingRoot, pendingKey, host, now); err != nil {
 		return Result{}, err
+	}
+	if err := os.Remove(result.PendingCAPath); err != nil {
+		return Result{}, fmt.Errorf("remove activated pending local CA certificate: %w", err)
+	}
+	if err := os.Remove(result.PendingKeyPath); err != nil {
+		return Result{}, fmt.Errorf("remove activated pending local CA private key: %w", err)
 	}
 	result.RootRotated = true
 	result.LeafIssued = true
-	result.InstanceID = fingerprint(newRoot)
+	result.InstanceID = fingerprint(pendingRoot)
 	return result, nil
+}
+
+// ClearPreviousRoot removes only the local rotation marker. It is deliberately
+// explicit because a prior root remains a valid Docker trust anchor until an
+// operator has completed their own trust-store cleanup.
+func ClearPreviousRoot(dataDir string) error {
+	if strings.TrimSpace(dataDir) == "" {
+		return errors.New("data directory is required")
+	}
+	path := filepath.Join(dataDir, "pki", previousRootFile)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove previous local CA certificate: %w", err)
+	}
+	return nil
 }
 
 func splitEndpoint(endpoint string) (string, string, error) {

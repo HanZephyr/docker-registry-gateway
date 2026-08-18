@@ -175,8 +175,19 @@ allow_non_range_providers: true
 	if exitCode := cli.Run(context.Background(), []string{"tls", "rotate-root", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("tls rotate-root exit code = %d, stderr = %s", exitCode, errors.String())
 	}
+	if !strings.Contains(output.String(), "已准备新根 CA") {
+		t.Errorf("rotation stdout = %q, want prepared root result", output.String())
+	}
+	if _, err := os.Stat(filepath.Join(configDirectory, ".drg", "pki", "ca.next.crt")); err != nil {
+		t.Errorf("pending root certificate not prepared: %v", err)
+	}
+	output.Reset()
+	errors.Reset()
+	if exitCode := cli.Run(context.Background(), []string{"tls", "rotate-root", "--activate", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("tls rotate-root --activate exit code = %d, stderr = %s", exitCode, errors.String())
+	}
 	if !strings.Contains(output.String(), "根 CA 已轮换") {
-		t.Errorf("rotation stdout = %q, want root rotation result", output.String())
+		t.Errorf("activation stdout = %q, want root rotation result", output.String())
 	}
 	if _, err := os.Stat(filepath.Join(configDirectory, ".drg", "pki", "ca.previous.crt")); err != nil {
 		t.Errorf("previous root certificate not preserved: %v", err)

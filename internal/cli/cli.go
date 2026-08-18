@@ -85,7 +85,7 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 
 func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	if len(arguments) == 0 {
-		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root> --config <路径>")
+		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root|clear-previous-root> --config <路径>")
 		return 2
 	}
 	switch arguments[0] {
@@ -93,8 +93,10 @@ func runTLS(ctx context.Context, arguments []string, output, errorOutput io.Writ
 		return runTLSReconcile(ctx, arguments[1:], output, errorOutput)
 	case "rotate-root":
 		return runTLSRotateRoot(ctx, arguments[1:], output, errorOutput)
+	case "clear-previous-root":
+		return runTLSClearPreviousRoot(arguments[1:], output, errorOutput)
 	default:
-		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root> --config <路径>")
+		fmt.Fprintln(errorOutput, "用法：drg tls <reconcile|rotate-root|clear-previous-root> --config <路径>")
 		return 2
 	}
 }
@@ -142,6 +144,7 @@ func runTLSRotateRoot(ctx context.Context, arguments []string, output, errorOutp
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	skipTrustInstall := flags.Bool("skip-trust-install", false, "跳过本次 Docker 信任安装")
+	activate := flags.Bool("activate", false, "确认新根已安装到 Docker 信任后，激活已准备的根轮换")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -158,29 +161,89 @@ func runTLSRotateRoot(ctx context.Context, arguments []string, output, errorOutp
 		fmt.Fprintln(errorOutput, "tls rotate-root 只适用于 local_ca: true；外部证书应由其签发方轮换。")
 		return 2
 	}
-	result, err := localca.RotateRoot(ctx, localca.Options{DataDir: loaded.DataDir, AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint})
+	options := localca.Options{DataDir: loaded.DataDir, AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint}
+	if *activate {
+		result, err := localca.ActivateRootRotation(ctx, options)
+		if err != nil {
+			fmt.Fprintf(errorOutput, "本地 CA 轮换激活失败: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(output, "根 CA 已轮换：新根=%s，旧根保留=%s。你已显式确认 Docker 已信任新根；旧根信任仅可通过 drg tls clear-previous-root 后清理。\n", result.CAPath, result.PreviousCAPath)
+		printRotationRestartNotice(ctx, loaded, output)
+		return 0
+	}
+	prepared, err := localca.PrepareRootRotation(ctx, options)
 	if err != nil {
-		fmt.Fprintf(errorOutput, "本地 CA 轮换失败: %v\n", err)
+		fmt.Fprintf(errorOutput, "本地 CA 轮换准备失败: %v\n", err)
 		return 1
 	}
-	if loaded.Server.TLS.InstallTrust && !*skipTrustInstall {
-		if err := installRootTrust(loaded, result.PreviousCAPath, "drg-ca-previous.crt", output); err != nil {
-			fmt.Fprintf(errorOutput, "安装上一根 Docker 信任 CA 失败: %v\n", err)
-			return 1
-		}
-		if err := installRootTrust(loaded, result.CAPath, "", output); err != nil {
-			fmt.Fprintf(errorOutput, "安装新 Docker 信任 CA 失败: %v\n", err)
-			return 1
-		}
+	if !loaded.Server.TLS.InstallTrust || *skipTrustInstall {
+		fmt.Fprintf(output, "已准备新根 CA：%s。当前 Gateway 与旧根保持不变；请先将该证书作为额外 Docker 信任根安装，再执行 drg tls rotate-root --activate --config %s。\n", prepared.PendingCAPath, *configPath)
+		return 0
 	}
+	trustResult, err := installRootTrust(loaded, prepared.PendingCAPath, "drg-ca-next.crt", output)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "安装待激活 Docker 信任根失败: %v\n", err)
+		return 1
+	}
+	if len(trustResult.Installed) == 0 {
+		fmt.Fprintf(output, "新根仍处于待激活状态：请按上面的部署说明安装 %s，确认完成后执行 drg tls rotate-root --activate --config %s。\n", prepared.PendingCAPath, *configPath)
+		return 0
+	}
+	result, err := localca.ActivateRootRotation(ctx, options)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "Docker 已信任新根，但本地 CA 激活失败；当前 Gateway 继续使用旧根: %v\n", err)
+		return 1
+	}
+	// The pending trust file keeps the new root valid throughout promotion. Add
+	// stable current/previous names afterwards; a failure here is non-fatal to
+	// trust continuity and is reported as a concrete manual follow-up.
+	if _, trustErr := installRootTrust(loaded, result.PreviousCAPath, "drg-ca-previous.crt", output); trustErr != nil {
+		fmt.Fprintf(output, "TLS 提示：旧根仍由现有 Docker 信任材料覆盖；未能写入稳定 previous 名称: %v\n", trustErr)
+	}
+	if _, trustErr := installRootTrust(loaded, result.CAPath, "", output); trustErr != nil {
+		fmt.Fprintf(output, "TLS 提示：新根仍由待激活 Docker 信任材料覆盖；未能写入稳定 current 名称: %v\n", trustErr)
+	}
+	fmt.Fprintf(output, "根 CA 已轮换：新根=%s，旧根保留=%s。旧根信任仅可通过 drg tls clear-previous-root 后清理。\n", result.CAPath, result.PreviousCAPath)
+	printRotationRestartNotice(ctx, loaded, output)
+	return 0
+}
+
+func printRotationRestartNotice(ctx context.Context, loaded config.Config, output io.Writer) {
 	statusContext, cancel := context.WithTimeout(ctx, time.Second)
 	_, runningErr := control.StatusRequest(statusContext, loaded.DataDir)
 	cancel()
 	if runningErr == nil {
-		fmt.Fprintln(output, "根 CA 已轮换，新旧根均已保留为 Docker 信任材料。正在运行的 Gateway 仍可能使用旧叶证书；请执行 drg restart 完成安全切换。")
-	} else {
-		fmt.Fprintln(output, "根 CA 已轮换，新旧根均已保留为 Docker 信任材料；下次启动将使用新叶证书。")
+		fmt.Fprintln(output, "正在运行的 Gateway 仍可能使用旧叶证书；请执行 drg restart 完成安全切换。")
+		return
 	}
+	fmt.Fprintln(output, "下次启动将使用新叶证书。")
+}
+
+func runTLSClearPreviousRoot(arguments []string, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet("tls clear-previous-root", flag.ContinueOnError)
+	flags.SetOutput(errorOutput)
+	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
+		if err == nil {
+			fmt.Fprintln(errorOutput, "tls clear-previous-root 不接受位置参数")
+		}
+		return 2
+	}
+	loaded, err := config.LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
+		return 1
+	}
+	if !loaded.Server.TLS.LocalCA {
+		fmt.Fprintln(errorOutput, "tls clear-previous-root 只适用于 local_ca: true")
+		return 2
+	}
+	if err := localca.ClearPreviousRoot(loaded.DataDir); err != nil {
+		fmt.Fprintf(errorOutput, "清理上一根本地 CA 失败: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(output, "已显式清理本地旧根标记。请同时按部署平台从 Docker 信任库清理 drg-ca-previous.crt（或对应旧根），随后才可再次轮换。")
 	return 0
 }
 
@@ -476,13 +539,13 @@ func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bo
 	if !loaded.Server.TLS.InstallTrust || skipTrustInstall {
 		return result, nil
 	}
-	if err := installRootTrust(loaded, result.CAPath, "", output); err != nil {
+	if _, err := installRootTrust(loaded, result.CAPath, "", output); err != nil {
 		return localca.Result{}, err
 	}
 	return result, nil
 }
 
-func installRootTrust(loaded config.Config, caPath, managedFileName string, output io.Writer) error {
+func installRootTrust(loaded config.Config, caPath, managedFileName string, output io.Writer) (trust.Result, error) {
 	trustResult, err := trust.Install(trust.Options{
 		CAPath:            caPath,
 		AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
@@ -490,7 +553,7 @@ func installRootTrust(loaded config.Config, caPath, managedFileName string, outp
 		IsContainer:       trust.InContainer(),
 	})
 	if err != nil {
-		return fmt.Errorf("安装 Docker 信任根: %w", err)
+		return trust.Result{}, fmt.Errorf("安装 Docker 信任根: %w", err)
 	}
 	for _, path := range trustResult.Installed {
 		fmt.Fprintf(output, "Docker 信任根已安装：%s\n", path)
@@ -501,7 +564,7 @@ func installRootTrust(loaded config.Config, caPath, managedFileName string, outp
 	for _, instruction := range trustResult.Instructions {
 		fmt.Fprintf(output, "TLS 操作：%s\n", instruction)
 	}
-	return nil
+	return trustResult, nil
 }
 
 const (

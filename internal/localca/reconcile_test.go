@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,7 +71,7 @@ func TestReconcileRejectsInsecureExistingRootPrivateKey(t *testing.T) {
 	}
 }
 
-func TestRotateRootPreservesPreviousTrustAndIssuesNewLeaf(t *testing.T) {
+func TestPreparedRootRotationPreservesCurrentTrustUntilActivation(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -84,13 +85,30 @@ func TestRotateRootPreservesPreviousTrustAndIssuesNewLeaf(t *testing.T) {
 		t.Fatalf("initial Reconcile() error = %v", err)
 	}
 	oldRoot := readCertificate(t, initial.CAPath)
-	rotated, err := localca.RotateRoot(context.Background(), localca.Options{
+	prepared, err := localca.PrepareRootRotation(context.Background(), localca.Options{
 		DataDir:           dataDir,
 		AdvertiseEndpoint: "drg.localhost:5443",
 		Now:               func() time.Time { return now.Add(time.Hour) },
 	})
 	if err != nil {
-		t.Fatalf("RotateRoot() error = %v", err)
+		t.Fatalf("PrepareRootRotation() error = %v", err)
+	}
+	if got := readCertificate(t, prepared.CAPath); string(got.Raw) != string(oldRoot.Raw) {
+		t.Fatal("prepared rotation changed the active root before Docker trust could be installed")
+	}
+	if _, err := os.Stat(prepared.PreviousCAPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previous CA exists before activation: %v", err)
+	}
+	if _, err := os.Stat(prepared.PendingCAPath); err != nil {
+		t.Fatalf("pending CA is missing: %v", err)
+	}
+	rotated, err := localca.ActivateRootRotation(context.Background(), localca.Options{
+		DataDir:           dataDir,
+		AdvertiseEndpoint: "drg.localhost:5443",
+		Now:               func() time.Time { return now.Add(time.Hour) },
+	})
+	if err != nil {
+		t.Fatalf("ActivateRootRotation() error = %v", err)
 	}
 	if !rotated.RootRotated || !rotated.LeafIssued || rotated.InstanceID == initial.InstanceID {
 		t.Errorf("rotation result = %+v, want a new root and leaf identity", rotated)
@@ -104,6 +122,30 @@ func TestRotateRootPreservesPreviousTrustAndIssuesNewLeaf(t *testing.T) {
 	roots.AddCert(newRoot)
 	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: "drg.localhost", CurrentTime: now.Add(2 * time.Hour)}); err != nil {
 		t.Errorf("rotated leaf does not verify against new root: %v", err)
+	}
+}
+
+func TestPrepareRootRotationRequiresExplicitPreviousRootCleanup(t *testing.T) {
+	t.Parallel()
+
+	options := localca.Options{DataDir: t.TempDir(), AdvertiseEndpoint: "drg.localhost:5443"}
+	if _, err := localca.Reconcile(context.Background(), options); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if _, err := localca.PrepareRootRotation(context.Background(), options); err != nil {
+		t.Fatalf("first PrepareRootRotation() error = %v", err)
+	}
+	if _, err := localca.ActivateRootRotation(context.Background(), options); err != nil {
+		t.Fatalf("ActivateRootRotation() error = %v", err)
+	}
+	if _, err := localca.PrepareRootRotation(context.Background(), options); err == nil {
+		t.Fatal("PrepareRootRotation() error = nil, want explicit previous-root cleanup requirement")
+	}
+	if err := localca.ClearPreviousRoot(options.DataDir); err != nil {
+		t.Fatalf("ClearPreviousRoot() error = %v", err)
+	}
+	if _, err := localca.PrepareRootRotation(context.Background(), options); err != nil {
+		t.Fatalf("PrepareRootRotation() after cleanup error = %v", err)
 	}
 }
 
