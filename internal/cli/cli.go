@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hjx/docker-registry-gateway/internal/certmanager"
 	"github.com/hjx/docker-registry-gateway/internal/config"
 	"github.com/hjx/docker-registry-gateway/internal/control"
 	"github.com/hjx/docker-registry-gateway/internal/eventlog"
@@ -400,7 +401,10 @@ func reconcileTLS(ctx context.Context, loaded config.Config, skipTrustInstall bo
 	return result, nil
 }
 
-const providerProbeInterval = 15 * time.Minute
+const (
+	providerProbeInterval        = 15 * time.Minute
+	certificateReconcileInterval = 24 * time.Hour
+)
 
 func runServe(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -424,7 +428,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	if err != nil {
 		absConfigPath = *configPath
 	}
-	var certificate *tls.Certificate
+	var certificateManager *certmanager.Manager
 	instanceID := externalInstanceID(loaded.DataDir)
 	if loaded.Server.TLS.LocalCA {
 		tlsResult, reconcileErr := reconcileTLS(ctx, loaded, false, output)
@@ -432,20 +436,20 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", reconcileErr)
 			return 1
 		}
-		loadedCertificate, loadErr := tls.LoadX509KeyPair(tlsResult.Certificate, tlsResult.PrivateKey)
+		manager, loadErr := certmanager.New(tlsResult.Certificate, tlsResult.PrivateKey)
 		if loadErr != nil {
 			fmt.Fprintf(errorOutput, "加载服务端证书失败: %v\n", loadErr)
 			return 1
 		}
-		certificate = &loadedCertificate
+		certificateManager = manager
 		instanceID = tlsResult.InstanceID
 	} else if loaded.Server.TLS.CertFile != "" {
-		loadedCertificate, loadErr := tls.LoadX509KeyPair(loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile)
+		manager, loadErr := certmanager.New(loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile)
 		if loadErr != nil {
 			fmt.Fprintf(errorOutput, "加载外部服务端证书失败: %v\n", loadErr)
 			return 1
 		}
-		certificate = &loadedCertificate
+		certificateManager = manager
 	} else {
 		fmt.Fprintln(output, "TLS 提示：local_ca 已关闭且未配置 cert_file/key_file，Gateway 将使用纯 HTTP 后端监听。")
 	}
@@ -491,6 +495,24 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			Message:    event.Message,
 		})
 	})
+	if certificateManager != nil {
+		stopCertificateMaintenance := startCertificateMaintenance(ctx, certificateReconcileInterval, func() error {
+			if loaded.Server.TLS.LocalCA {
+				result, err := reconcileTLS(ctx, loaded, true, io.Discard)
+				if err != nil {
+					return err
+				}
+				if !result.LeafIssued {
+					return nil
+				}
+			}
+			return certificateManager.Reload()
+		}, func(err error) {
+			_ = events.Write(eventlog.Event{Level: "warning", Code: "tls_maintenance_failed", Message: "TLS certificate reconciliation or reload failed"})
+			fmt.Fprintf(errorOutput, "TLS 定期维护失败；当前已加载的证书继续服务，新连接不会使用未验证的新证书: %v\n", err)
+		})
+		defer stopCertificateMaintenance()
+	}
 	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
@@ -508,8 +530,8 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			},
 		}), loaded.Resources.MaxInflightRequests),
 	}
-	if certificate != nil {
-		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*certificate}, MinVersion: tls.VersionTLS12}
+	if certificateManager != nil {
+		server.TLSConfig = &tls.Config{GetCertificate: certificateManager.GetCertificate, MinVersion: tls.VersionTLS12}
 	}
 
 	listeners := make([]net.Listener, 0, len(loaded.Server.Listeners))
@@ -750,6 +772,42 @@ func startPeriodicProviderProbes(parent context.Context, interval time.Duration,
 				default:
 				}
 				launch(current())
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(stopping)
+			group.Wait()
+		})
+	}
+}
+
+// startCertificateMaintenance reconciles local CA leaf certificates, or
+// reloads externally managed files, without interrupting active TLS sessions.
+// A failed pass deliberately leaves the last known-good certificate active.
+func startCertificateMaintenance(parent context.Context, interval time.Duration, maintain func() error, report func(error)) func() {
+	if interval <= 0 || maintain == nil {
+		return func() {}
+	}
+	stopping := make(chan struct{})
+	var once sync.Once
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-parent.Done():
+				return
+			case <-stopping:
+				return
+			case <-ticker.C:
+				if err := maintain(); err != nil && report != nil {
+					report(err)
+				}
 			}
 		}
 	}()

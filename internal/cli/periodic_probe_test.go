@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -51,4 +52,26 @@ func TestPeriodicProviderProbesUseLatestConfigurationAndStop(t *testing.T) {
 		t.Fatalf("probe %q launched after stop", got)
 	case <-time.After(30 * time.Millisecond):
 	}
+}
+
+func TestCertificateMaintenanceReportsFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reported := make(chan error, 4)
+	stop := startCertificateMaintenance(ctx, 10*time.Millisecond, func() error {
+		return errors.New("certificate file is invalid")
+	}, func(err error) {
+		reported <- err
+	})
+	select {
+	case err := <-reported:
+		if err == nil || err.Error() != "certificate file is invalid" {
+			t.Errorf("reported maintenance error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("certificate maintenance failure was not reported")
+	}
+	stop()
 }
