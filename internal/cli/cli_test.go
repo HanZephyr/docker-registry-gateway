@@ -224,7 +224,7 @@ providers:
 	if exitCode := cli.Run(context.Background(), []string{"doctor", "--skip-providers", "--skip-docker", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("doctor exit code = %d, stderr = %s, stdout = %s", exitCode, errors.String(), output.String())
 	}
-	for _, expected := range []string{"配置：正常", "TLS：正常", "Docker daemon：已按参数跳过检查", "Docker 镜像源配置与根证书信任属于部署边界"} {
+	for _, expected := range []string{"配置：正常", "TLS：正常", "Docker 根证书信任：配置已关闭自动安装", "Docker daemon：已按参数跳过检查", "Docker 镜像源配置属于部署边界"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Errorf("doctor output lacks %q:\n%s", expected, output.String())
 		}

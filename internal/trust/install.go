@@ -3,6 +3,10 @@
 package trust
 
 import (
+	"crypto/sha1"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -36,6 +40,82 @@ type Result struct {
 	Installed    []string
 	Notices      []string
 	Instructions []string
+}
+
+// Diagnosis is the read-only trust result consumed by `drg doctor`.
+// Checked=false means DRG cannot safely inspect the daemon host (for example
+// when DRG itself is running inside a container).
+type Diagnosis struct {
+	Checked bool
+	Trusted bool
+	Details string
+}
+
+// Diagnose verifies the current local root in the Docker trust location that
+// DRG can identify without changing Docker configuration or certificates.
+func Diagnose(options Options) (Diagnosis, error) {
+	if strings.TrimSpace(options.CAPath) == "" {
+		return Diagnosis{}, errors.New("CA path is required")
+	}
+	contents, err := os.ReadFile(options.CAPath)
+	if err != nil {
+		return Diagnosis{}, fmt.Errorf("read local root CA: %w", err)
+	}
+	if options.IsContainer {
+		return Diagnosis{Details: "DRG 正在容器内运行，无法安全读取 Docker 宿主机信任库；请按 tls reconcile 输出的宿主机步骤核验。"}, nil
+	}
+	platform := options.Platform
+	if platform == "" {
+		platform = runtime.GOOS
+	}
+	names, err := registryNames(options.AdvertiseEndpoint)
+	if err != nil {
+		return Diagnosis{}, err
+	}
+	switch platform {
+	case "linux":
+		baseDirectory := options.LinuxCertsDir
+		if baseDirectory == "" {
+			baseDirectory = "/etc/docker/certs.d"
+		}
+		for _, name := range names {
+			path := filepath.Join(baseDirectory, name, managedCAFile)
+			installed, readErr := os.ReadFile(path)
+			if readErr != nil || !sameCertificate(contents, installed) {
+				return Diagnosis{Checked: true, Details: fmt.Sprintf("Docker 信任文件缺失或不匹配：%s", path)}, nil
+			}
+		}
+		return Diagnosis{Checked: true, Trusted: true, Details: "Docker certs.d 当前根证书与 DRG 本地根一致"}, nil
+	case "windows":
+		return diagnoseWindowsTrust(options, contents)
+	case "darwin":
+		return diagnoseMacOSTrust(options, contents)
+	default:
+		return Diagnosis{Details: fmt.Sprintf("当前平台 %s 没有可安全读取的 Docker 根证书位置。", platform)}, nil
+	}
+}
+
+func sameCertificate(left, right []byte) bool {
+	leftCertificate, leftErr := parseCertificate(left)
+	rightCertificate, rightErr := parseCertificate(right)
+	return leftErr == nil && rightErr == nil && string(leftCertificate.Raw) == string(rightCertificate.Raw)
+}
+
+func parseCertificate(contents []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(contents)
+	if block == nil {
+		return nil, errors.New("certificate PEM block is missing")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+func rootSHA1(contents []byte) (string, error) {
+	certificate, err := parseCertificate(contents)
+	if err != nil {
+		return "", err
+	}
+	sum := sha1.Sum(certificate.Raw)
+	return strings.ToUpper(hex.EncodeToString(sum[:])), nil
 }
 
 // Install updates native Docker trust locations when the current process can

@@ -1635,6 +1635,28 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 		fmt.Fprintf(output, "TLS：异常（%v）；可执行 drg tls reconcile 处理\n", err)
 		failed = true
 	}
+	if loaded.Server.TLS.LocalCA {
+		if !loaded.Server.TLS.InstallTrust {
+			fmt.Fprintln(output, "Docker 根证书信任：配置已关闭自动安装，未做宿主机信任检查。")
+		} else {
+			diagnosis, trustErr := trust.Diagnose(trust.Options{
+				CAPath:            filepath.Join(loaded.DataDir, "pki", "ca.crt"),
+				AdvertiseEndpoint: loaded.Server.TLS.AdvertiseEndpoint,
+				IsContainer:       trust.InContainer(),
+			})
+			if trustErr != nil {
+				fmt.Fprintf(output, "Docker 根证书信任：异常（%v）\n", trustErr)
+				failed = true
+			} else if !diagnosis.Checked {
+				fmt.Fprintf(output, "Docker 根证书信任：无法自动核验（%s）\n", diagnosis.Details)
+			} else if !diagnosis.Trusted {
+				fmt.Fprintf(output, "Docker 根证书信任：异常（%s）；可执行 drg tls reconcile。\n", diagnosis.Details)
+				failed = true
+			} else {
+				fmt.Fprintf(output, "Docker 根证书信任：正常（%s）\n", diagnosis.Details)
+			}
+		}
+	}
 	if !*skipProviders {
 		for _, configured := range loaded.Providers {
 			probeContext, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -1672,7 +1694,7 @@ func runDoctor(ctx context.Context, arguments []string, output, errorOutput io.W
 			fmt.Fprintf(output, "Docker daemon：可达（Server %s）\n", strings.TrimSpace(string(version)))
 		}
 	}
-	fmt.Fprintln(output, "Docker 镜像源配置与根证书信任属于部署边界，doctor 不读取或修改 Docker 配置。")
+	fmt.Fprintln(output, "Docker 镜像源配置属于部署边界，doctor 不读取或修改 Docker 配置；根证书仅在可识别的本机信任位置只读核验。")
 	if failed {
 		return 1
 	}
