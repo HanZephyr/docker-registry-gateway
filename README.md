@@ -32,7 +32,7 @@ drg onboard
 ## 常用维护命令
 
 ```powershell
-drg doctor --skip-providers       # 只读诊断配置、TLS、监听和 Docker daemon
+drg doctor --skip-providers       # 只读诊断配置、TLS、Docker 根信任、监听和 Docker daemon
 drg config migrate                # 检查是否需要迁移配置格式
 drg provider list
 drg provider add --name mirror-a --url https://example.invalid --pull-provider
@@ -42,8 +42,16 @@ drg events --limit 50
 drg stop                           # 显示排空进度，最长等待 30 秒
 drg stop --force                   # 立即中断活跃拉取
 drg tls reconcile
-drg tls rotate-root                # 保留旧根的信任材料后轮换本地 CA
+drg tls rotate-root                # 先准备新根并安装为额外 Docker 信任根，再安全激活
+drg tls rotate-root --activate     # 容器部署时，在宿主机完成手动信任安装后的显式确认
+drg tls clear-previous-root        # 完成旧根 Docker 信任清理后，显式解除下一次轮换锁定
 ```
+
+### 本地 CA 根轮换
+
+`drg tls rotate-root` 绝不会先切换服务端证书再尝试安装 Docker 信任。它先将 `ca.next.crt` 作为额外信任根安装；成功后才激活新根和新叶证书，并保留旧根为 `ca.previous.crt`。容器内运行时，DRG 不会猜测宿主机路径：它会停在“待激活”状态、输出宿主机操作说明，用户完成信任安装后执行带 `--activate` 的同一命令。
+
+旧根的本地标记会一直保留，避免下一次轮换误删迁移材料。仅当你已从 Docker 信任库显式移除旧根后，才执行 `drg tls clear-previous-root`。根轮换完成后重启 Gateway，使新连接使用新叶证书。
 
 ## 容器部署
 
