@@ -30,6 +30,7 @@ type Options struct {
 	ConflictStrategy         string
 	TieBreaker               string
 	Salt                     []byte
+	Health                   *Health
 	NoRangeRestartEnabled    *bool
 	MaxNoRangeRestartDiscard int64
 	DecisionLease            time.Duration
@@ -46,6 +47,7 @@ type Router struct {
 	maxNoRangeRestartDiscard int64
 	decisionLease            time.Duration
 	leaseStore               *lease.Store
+	health                   *Health
 }
 
 // New creates a Router. Configuration validation guarantees sources contain
@@ -67,6 +69,10 @@ func New(sources []Source, options Options) *Router {
 	if maxNoRangeRestartDiscard == 0 {
 		maxNoRangeRestartDiscard = 64 << 20
 	}
+	health := options.Health
+	if health == nil {
+		health = NewHealth()
+	}
 	return &Router{
 		sources:                  append([]Source(nil), sources...),
 		conflictStrategy:         conflictStrategy,
@@ -76,6 +82,7 @@ func New(sources []Source, options Options) *Router {
 		maxNoRangeRestartDiscard: maxNoRangeRestartDiscard,
 		decisionLease:            options.DecisionLease,
 		leaseStore:               options.LeaseStore,
+		health:                   health,
 	}
 }
 
@@ -277,33 +284,35 @@ func (router *Router) breakTie(repository, reference string, accepts []string, c
 func (router *Router) Blob(ctx context.Context, repository, digest, rangeHeader string) (registry.Blob, error) {
 	allNotFound := true
 	attempted := make(map[int]bool)
-	for index, source := range router.sources {
-		if !source.PullProvider || source.Backend == nil {
-			continue
-		}
+	for _, index := range router.health.orderedPullSourceIndexes(router.sources) {
+		source := router.sources[index]
 		blob, err := source.Backend.Blob(ctx, repository, digest, rangeHeader)
 		if err == nil {
 			if !validInitialBlob(blob, digest) {
 				_ = blob.Reader.Close()
+				router.health.RecordFailure(source.Name)
 				allNotFound = false
 				continue
 			}
 			attempted[index] = true
 			blob.Reader = &resumableBlobReader{
-				ctx:        ctx,
-				router:     router,
-				repository: repository,
-				digest:     digest,
-				current:    blob.Reader,
-				currentAt:  index,
-				attempted:  attempted,
-				offset:     blob.Start,
-				end:        blob.End,
-				size:       blob.Size,
+				ctx:         ctx,
+				router:      router,
+				repository:  repository,
+				digest:      digest,
+				current:     blob.Reader,
+				currentAt:   index,
+				currentName: source.Name,
+				startedAt:   time.Now(),
+				attempted:   attempted,
+				offset:      blob.Start,
+				end:         blob.End,
+				size:        blob.Size,
 			}
 			return blob, nil
 		}
 		if !errors.Is(err, registry.ErrNotFound) {
+			router.health.RecordFailure(source.Name)
 			allNotFound = false
 		}
 	}
@@ -319,13 +328,17 @@ type resumableBlobReader struct {
 	repository string
 	digest     string
 
-	current   io.ReadCloser
-	currentAt int
-	attempted map[int]bool
-	offset    int64
-	end       int64
-	size      int64
-	pending   error
+	current       io.ReadCloser
+	currentAt     int
+	currentName   string
+	startedAt     time.Time
+	transferBytes int64
+	recorded      bool
+	attempted     map[int]bool
+	offset        int64
+	end           int64
+	size          int64
+	pending       error
 }
 
 func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
@@ -336,10 +349,13 @@ func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
 	}
 	count, err := reader.current.Read(buffer)
 	reader.offset += int64(count)
+	reader.transferBytes += int64(count)
 	if reader.offset > reader.end+1 {
+		reader.recordFailure()
 		return count, io.ErrUnexpectedEOF
 	}
 	if reader.offset == reader.end+1 {
+		reader.recordSuccess()
 		if err != nil && !errors.Is(err, io.EOF) {
 			return count, io.EOF
 		}
@@ -359,8 +375,10 @@ func (reader *resumableBlobReader) Read(buffer []byte) (int, error) {
 
 func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, error) {
 	_ = reader.current.Close()
-	for index, source := range reader.router.sources {
-		if reader.attempted[index] || !source.PullProvider || source.Backend == nil {
+	reader.recordFailure()
+	for _, index := range reader.router.health.orderedPullSourceIndexes(reader.router.sources) {
+		source := reader.router.sources[index]
+		if reader.attempted[index] {
 			continue
 		}
 		reader.attempted[index] = true
@@ -369,26 +387,55 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 		if err == nil && validResumedBlob(blob, reader.digest, reader.offset, reader.end, reader.size) {
 			reader.current = blob.Reader
 			reader.currentAt = index
+			reader.currentName = source.Name
+			reader.startedAt = time.Now()
+			reader.transferBytes = 0
+			reader.recorded = false
 			return reader.Read(buffer)
 		}
 		if blob.Reader != nil {
 			_ = blob.Reader.Close()
 		}
 		if reader.router.noRangeRestartEnabled && reader.offset <= reader.router.maxNoRangeRestartDiscard {
-			if restarted, restartedErr := source.Backend.Blob(reader.ctx, reader.repository, reader.digest, ""); restartedErr == nil && validRestartedBlob(restarted, reader.digest, reader.size) {
-				if _, discardErr := io.CopyN(io.Discard, restarted.Reader, reader.offset); discardErr == nil {
-					reader.current = restarted.Reader
-					reader.currentAt = index
-					return reader.Read(buffer)
+			if restarted, restartedErr := source.Backend.Blob(reader.ctx, reader.repository, reader.digest, ""); restartedErr == nil {
+				if validRestartedBlob(restarted, reader.digest, reader.size) {
+					if _, discardErr := io.CopyN(io.Discard, restarted.Reader, reader.offset); discardErr == nil {
+						reader.current = restarted.Reader
+						reader.currentAt = index
+						reader.currentName = source.Name
+						reader.startedAt = time.Now()
+						reader.transferBytes = 0
+						reader.recorded = false
+						return reader.Read(buffer)
+					}
 				}
-				_ = restarted.Reader.Close()
+				if restarted.Reader != nil {
+					_ = restarted.Reader.Close()
+				}
 			}
 		}
+		reader.router.health.RecordFailure(source.Name)
 	}
 	if errors.Is(cause, io.EOF) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	return 0, cause
+}
+
+func (reader *resumableBlobReader) recordSuccess() {
+	if reader.recorded {
+		return
+	}
+	reader.recorded = true
+	reader.router.health.RecordSuccess(reader.currentName, reader.transferBytes, time.Since(reader.startedAt))
+}
+
+func (reader *resumableBlobReader) recordFailure() {
+	if reader.recorded {
+		return
+	}
+	reader.recorded = true
+	reader.router.health.RecordFailure(reader.currentName)
 }
 
 func (reader *resumableBlobReader) Close() error {

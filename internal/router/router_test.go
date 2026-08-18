@@ -101,6 +101,67 @@ func TestBlobFallsBackToNextPullProvider(t *testing.T) {
 	}
 }
 
+func TestBlobPrefersProviderWithBetterRecentThroughput(t *testing.T) {
+	t.Parallel()
+
+	tracker := router.NewHealth()
+	tracker.RecordSuccess("slow", 1<<20, time.Second)
+	tracker.RecordSuccess("fast", 10<<20, time.Second)
+	var attempts []string
+	backend := func(name string) functionBackend {
+		return functionBackend{blob: func(context.Context, string, string, string) (registry.Blob, error) {
+			attempts = append(attempts, name)
+			return registry.Blob{Digest: "sha256:blob", Size: 1, Start: 0, End: 0, Reader: io.NopCloser(strings.NewReader("x"))}, nil
+		}}
+	}
+	gateway := router.New([]router.Source{
+		{Name: "slow", PullProvider: true, Backend: backend("slow")},
+		{Name: "fast", PullProvider: true, Backend: backend("fast")},
+	}, router.Options{Health: tracker})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+	if _, err := io.ReadAll(blob.Reader); err != nil {
+		t.Fatalf("read blob: %v", err)
+	}
+	if got, want := strings.Join(attempts, ","), "fast"; got != want {
+		t.Errorf("Provider attempts = %q, want %q", got, want)
+	}
+}
+
+func TestBlobAvoidsRecentlyFailingProvider(t *testing.T) {
+	t.Parallel()
+
+	tracker := router.NewHealth()
+	tracker.RecordFailure("unreliable")
+	var attempts []string
+	backend := func(name string) functionBackend {
+		return functionBackend{blob: func(context.Context, string, string, string) (registry.Blob, error) {
+			attempts = append(attempts, name)
+			return registry.Blob{Digest: "sha256:blob", Size: 1, Start: 0, End: 0, Reader: io.NopCloser(strings.NewReader("x"))}, nil
+		}}
+	}
+	gateway := router.New([]router.Source{
+		{Name: "unreliable", PullProvider: true, Backend: backend("unreliable")},
+		{Name: "stable", PullProvider: true, Backend: backend("stable")},
+	}, router.Options{Health: tracker})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	defer blob.Reader.Close()
+	if _, err := io.ReadAll(blob.Reader); err != nil {
+		t.Fatalf("read blob: %v", err)
+	}
+	if got, want := strings.Join(attempts, ","), "stable"; got != want {
+		t.Errorf("Provider attempts = %q, want %q", got, want)
+	}
+}
+
 func TestBlobResumesFromNextRangeProviderAfterInterruptedRead(t *testing.T) {
 	t.Parallel()
 
