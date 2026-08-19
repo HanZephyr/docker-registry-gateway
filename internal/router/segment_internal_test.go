@@ -11,6 +11,24 @@ import (
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 )
 
+func TestPlanSegmentsHonorsMinimumLogicalSegmentSize(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minimum = int64(16 << 20)
+		size    = int64(33 << 20)
+	)
+	segments := planSegments(size, 4, minimum)
+	if got, want := len(segments), 2; got != want {
+		t.Fatalf("segment count = %d, want %d", got, want)
+	}
+	for index, segment := range segments {
+		if length := segment.end - segment.start + 1; length < minimum {
+			t.Errorf("segment %d length = %d, want at least %d", index, length, minimum)
+		}
+	}
+}
+
 func TestSegmentedReaderFallsBackAfterStorageFailure(t *testing.T) {
 	t.Parallel()
 

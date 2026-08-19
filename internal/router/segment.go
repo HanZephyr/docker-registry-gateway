@@ -84,7 +84,9 @@ func planSegments(size int64, maximum int, minimumSize int64) []segment {
 	if size <= 0 || maximum < 2 || minimumSize <= 0 || minimumSize > size/2 {
 		return nil
 	}
-	requested := (size-1)/minimumSize + 1
+	// A segment count must not make an even logical split smaller than the
+	// configured minimum. Floor, rather than ceiling, preserves that contract.
+	requested := size / minimumSize
 	count := maximum
 	if requested < int64(maximum) {
 		count = int(requested)
