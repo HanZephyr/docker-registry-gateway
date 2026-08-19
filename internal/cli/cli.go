@@ -57,8 +57,10 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 		return runConfig(arguments[1:], output, errorOutput)
 	case "doctor":
 		return runDoctor(ctx, arguments[1:], output, errorOutput)
+	case "logs":
+		return runLogs(ctx, "logs", arguments[1:], input, output, errorOutput)
 	case "events":
-		return runEvents(ctx, arguments[1:], input, output, errorOutput)
+		return runLogs(ctx, "events", arguments[1:], input, output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
 	case "start":
@@ -604,7 +606,16 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintf(errorOutput, "读取或校验配置失败: %v\n", err)
 		return 1
 	}
-	printSecurityWarnings(output, loaded)
+	eventRetention, healthRetention, err := retentionConfiguration(loaded)
+	if err != nil {
+		fmt.Fprintf(errorOutput, "读取诊断文件保留配置失败: %v\n", err)
+		return 1
+	}
+	events := eventlog.New(loaded.DataDir, time.Now, eventRetention)
+	serviceLogs := newServiceLogger(events, output)
+	for _, warning := range loaded.SecurityWarnings() {
+		serviceLogs.log("warning", "security_warning", warning.Message)
+	}
 
 	absConfigPath, err := filepath.Abs(*configPath)
 	if err != nil {
@@ -613,13 +624,15 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	var certificateManager *certmanager.Manager
 	instanceID := externalInstanceID(loaded.DataDir)
 	if loaded.Server.TLS.LocalCA {
-		tlsResult, reconcileErr := reconcileTLS(ctx, loaded, false, output)
+		tlsResult, reconcileErr := reconcileTLS(ctx, loaded, false, serviceLogs)
 		if reconcileErr != nil {
+			serviceLogs.log("error", "tls_reconcile_failed", "TLS 对账失败；Gateway 未启动")
 			fmt.Fprintf(errorOutput, "TLS 对账失败: %v\n", reconcileErr)
 			return 1
 		}
 		manager, loadErr := certmanager.New(tlsResult.Certificate, tlsResult.PrivateKey)
 		if loadErr != nil {
+			serviceLogs.log("error", "tls_certificate_load_failed", "加载服务端证书失败；Gateway 未启动")
 			fmt.Fprintf(errorOutput, "加载服务端证书失败: %v\n", loadErr)
 			return 1
 		}
@@ -628,51 +641,50 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	} else if loaded.Server.TLS.CertFile != "" {
 		manager, loadErr := certmanager.New(loaded.Server.TLS.CertFile, loaded.Server.TLS.KeyFile)
 		if loadErr != nil {
+			serviceLogs.log("error", "tls_certificate_load_failed", "加载外部服务端证书失败；Gateway 未启动")
 			fmt.Fprintf(errorOutput, "加载外部服务端证书失败: %v\n", loadErr)
 			return 1
 		}
 		certificateManager = manager
 	} else {
-		fmt.Fprintln(output, "TLS 提示：local_ca 已关闭且未配置 cert_file/key_file，Gateway 将使用纯 HTTP 后端监听。")
+		serviceLogs.log("warning", "tls_http_backend", "local_ca 已关闭且未配置 cert_file/key_file，Gateway 使用纯 HTTP 后端监听")
 	}
 	routeGuard := routeguard.New(instanceID, 3)
 	admitProvider := func(parent context.Context, configured config.Provider, probeRef string, allowNonRange bool) (provider.ProbeResult, error) {
 		return probeProviderAdmissionWithGuard(parent, configured, probeRef, allowNonRange, routeGuard)
 	}
 	if err := requireRangeProviderAdmission(ctx, loaded, admitProvider); err != nil {
+		serviceLogs.log("error", "provider_admission_failed", "Provider Range 准入失败；Gateway 未启动")
 		fmt.Fprintf(errorOutput, "Provider Range 准入失败: %v\n", err)
-		return 1
-	}
-
-	eventRetention, healthRetention, err := retentionConfiguration(loaded)
-	if err != nil {
-		fmt.Fprintf(errorOutput, "读取诊断文件保留配置失败: %v\n", err)
 		return 1
 	}
 	tracker := router.NewHealth()
 	healthStore := healthhistory.Open(filepath.Join(loaded.DataDir, "provider-health.json"), time.Now, healthRetention)
 	if snapshots, loadErr := healthStore.Load(healthRetention); loadErr != nil {
+		serviceLogs.log("warning", "health_history_load_failed", "读取 Provider 健康历史失败；将以空历史启动")
 		fmt.Fprintf(errorOutput, "读取 Provider 健康历史失败，将以空历史启动: %v\n", loadErr)
 	} else {
 		tracker.Restore(snapshots)
 	}
 	temporaryDiskQuota, err := config.ParseByteSize(loaded.Resources.TemporaryDiskQuota)
 	if err != nil {
+		serviceLogs.log("error", "temporary_disk_quota_invalid", "读取临时磁盘配额失败；Gateway 未启动")
 		fmt.Fprintf(errorOutput, "读取临时磁盘配额失败: %v\n", err)
 		return 1
 	}
 	tempBudget := router.NewTempBudget(temporaryDiskQuota)
 	temporaryWorkspace, err := tempstate.Prepare(loaded.Resources.TempDir, loaded.DataDir)
 	if err != nil {
+		serviceLogs.log("error", "temporary_workspace_prepare_failed", "初始化分片临时目录失败；Gateway 未启动")
 		fmt.Fprintf(errorOutput, "初始化分片临时目录失败: %v\n", err)
 		return 1
 	}
 	defer func() {
 		if cleanupErr := temporaryWorkspace.Close(); cleanupErr != nil {
+			serviceLogs.log("warning", "temporary_workspace_cleanup_failed", "清理分片临时目录失败；下次启动将安全重试")
 			fmt.Fprintf(errorOutput, "清理分片临时目录失败（下次启动将安全重试）: %v\n", cleanupErr)
 		}
 	}()
-	events := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	eventObserver := router.ObserverFunc(func(event router.Event) {
 		_ = events.Write(eventlog.Event{
 			Level:        event.Level,
@@ -698,13 +710,14 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			}
 			return certificateManager.Reload()
 		}, func(err error) {
-			_ = events.Write(eventlog.Event{Level: "warning", Code: "tls_maintenance_failed", Message: "TLS certificate reconciliation or reload failed"})
+			serviceLogs.log("warning", "tls_maintenance_failed", "TLS 定期维护失败；当前已加载的证书继续服务")
 			fmt.Fprintf(errorOutput, "TLS 定期维护失败；当前已加载的证书继续服务，新连接不会使用未验证的新证书: %v\n", err)
 		})
 		defer stopCertificateMaintenance()
 	}
 	runtimeRouter, err := buildRouter(loaded, []byte(absConfigPath), tracker, tempBudget, temporaryWorkspace.Dir, routeGuard, eventObserver)
 	if err != nil {
+		serviceLogs.log("error", "router_initialize_failed", "初始化 Provider 路由失败；Gateway 未启动")
 		fmt.Fprintf(errorOutput, "初始化 Provider 路由失败: %v\n", err)
 		return 1
 	}
@@ -731,6 +744,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			for _, opened := range listeners {
 				opened.Close()
 			}
+			serviceLogs.log("error", "listener_open_failed", "监听地址失败；Gateway 未启动")
 			fmt.Fprintf(errorOutput, "监听 %s 失败: %v\n", address, err)
 			return 1
 		}
@@ -743,7 +757,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	var reloadMu sync.Mutex
 	currentConfig := loaded
 	probeContext, stopProbing := context.WithCancel(ctx)
-	_ = events.Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway 已启动"})
+	serviceLogs.log("info", "gateway_started", "Gateway 已启动；监听："+strings.Join(loaded.Server.Listeners, ", ")+"；本地控制面正在初始化")
 	var probeMu sync.Mutex
 	var probeGroup sync.WaitGroup
 	probesStopping := false
@@ -751,6 +765,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	probeOutput := &lockedWriter{writer: output}
 	persistHealth := func() {
 		if err := healthStore.Save(tracker.Snapshot()); err != nil {
+			serviceLogs.log("warning", "health_history_save_failed", "保存 Provider 健康历史失败")
 			fmt.Fprintf(probeOutput, "保存 Provider 健康历史失败: %v\n", err)
 		}
 	}
@@ -794,7 +809,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 				probeMu.Unlock()
 				probeGroup.Done()
 			}()
-			probeProviders(probeContext, configuration, probeOutput, events, routeGuard, tracker)
+			probeProviders(probeContext, configuration, events, routeGuard, tracker)
 		}()
 	}
 	defer func() {
@@ -867,12 +882,12 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		for _, listener := range listeners {
 			_ = listener.Close()
 		}
+		serviceLogs.log("error", "local_control_start_failed", "启动本地控制面失败；Gateway 未启动")
 		fmt.Fprintf(errorOutput, "启动本地控制面失败: %v\n", err)
 		return 1
 	}
 	defer localControl.Close()
-	fmt.Fprintf(output, "DRG 已启动：%s\n", strings.Join(loaded.Server.Listeners, ", "))
-	fmt.Fprintln(output, "本地控制面已就绪：可使用 drg status、drg reload、drg stop。")
+	serviceLogs.log("info", "gateway_ready", "Gateway 已就绪；可使用 drg status、drg reload、drg stop 或 drg logs --follow")
 	launchProbe(loaded)
 
 	serveErrors := make(chan error, len(listeners))
@@ -888,20 +903,23 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	case <-ctx.Done():
 		_ = server.Shutdown(context.Background())
 		group.Wait()
+		serviceLogs.log("info", "gateway_stopped", "Gateway 已停止")
 		return 0
 	case serveErr := <-serveErrors:
 		if !errors.Is(serveErr, http.ErrServerClosed) {
+			serviceLogs.log("error", "gateway_stopped_unexpected", "Gateway 因监听服务错误停止")
 			fmt.Fprintf(errorOutput, "服务停止: %v\n", serveErr)
 			_ = server.Close()
 			group.Wait()
 			return 1
 		}
 		group.Wait()
+		serviceLogs.log("info", "gateway_stopped", "Gateway 已停止")
 		return 0
 	}
 }
 
-func probeProviders(parent context.Context, loaded config.Config, output io.Writer, events *eventlog.Log, routeGuard routeguard.Guard, tracker *router.Health) {
+func probeProviders(parent context.Context, loaded config.Config, events *eventlog.Log, routeGuard routeguard.Guard, tracker *router.Health) {
 	for _, configured := range loaded.Providers {
 		if parent.Err() != nil {
 			return
@@ -922,16 +940,13 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 				if probeErr == nil {
 					if result.RangeSupported {
 						tracker.RecordProbeSuccess(configured.Name)
-						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "Range=true"})
-						fmt.Fprintf(output, "Provider %s 准入探测通过：支持 Range 续传。\n", configured.Name)
+						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "准入探测通过：支持 Range 续传"})
 					} else if loaded.AllowNonRangeProviders {
 						tracker.RecordProbeSuccess(configured.Name)
-						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "Range=false; degraded"})
-						fmt.Fprintf(output, "Provider %s 准入探测通过但不支持 Range：仅作为降级下载源。\n", configured.Name)
+						_ = events.Write(eventlog.Event{Level: "info", Code: "provider_probe_ok", Provider: configured.Name, Message: "准入探测通过但不支持 Range；仅作为降级下载源"})
 					} else {
 						tracker.RecordRangeUnsupported(configured.Name)
-						_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_range_unsupported", Provider: configured.Name, Message: "Provider no longer supports required Range requests and was withheld"})
-						fmt.Fprintf(output, "Provider %s 准入探测不通过：不支持 Range，当前配置已禁用无 Range Provider。\n", configured.Name)
+						_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_range_unsupported", Provider: configured.Name, Message: "准入探测不通过：不支持 Range，当前配置已禁用无 Range Provider"})
 					}
 					cancel()
 					continue
@@ -944,8 +959,7 @@ func probeProviders(parent context.Context, loaded config.Config, output io.Writ
 			return
 		}
 		tracker.RecordProviderFailure(configured.Name, err)
-		_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_probe_failed", Provider: configured.Name, Message: "provider admission probe failed"})
-		fmt.Fprintf(output, "Provider %s 主动探测失败：%v；服务将继续运行，并在下一次主动探测或后续拉取中恢复。\n", configured.Name, err)
+		_ = events.Write(eventlog.Event{Level: "warning", Code: "provider_probe_failed", Provider: configured.Name, Message: "Provider 主动探测失败；服务将继续运行，并在下一次主动探测或后续拉取中恢复"})
 	}
 }
 
@@ -1405,27 +1419,18 @@ func runStart(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		fmt.Fprintf(errorOutput, "创建数据目录失败: %v\n", err)
 		return 1
 	}
-	logPath := filepath.Join(loaded.DataDir, "serve.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		fmt.Fprintf(errorOutput, "打开服务日志失败: %v\n", err)
-		return 1
-	}
 	executable, err := os.Executable()
 	if err != nil {
-		logFile.Close()
 		fmt.Fprintf(errorOutput, "定位 drg 可执行文件失败: %v\n", err)
 		return 1
 	}
 	command := exec.Command(executable, "serve", "--config", configPath)
-	command.Stdout = logFile
-	command.Stderr = logFile
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
 	if err := command.Start(); err != nil {
-		logFile.Close()
 		fmt.Fprintf(errorOutput, "启动 Gateway 子进程失败: %v\n", err)
 		return 1
 	}
-	_ = logFile.Close()
 	go func() { _ = command.Wait() }()
 
 	deadline := time.Now().Add(10 * time.Second)
@@ -1434,12 +1439,12 @@ func runStart(ctx context.Context, arguments []string, output, errorOutput io.Wr
 		status, err := control.StatusRequest(probeContext, loaded.DataDir)
 		cancel()
 		if err == nil && status.PID == command.Process.Pid {
-			fmt.Fprintf(output, "DRG 已在后台启动（PID %d）。日志：%s\n", status.PID, logPath)
+			fmt.Fprintf(output, "DRG 已在后台启动（PID %d）。使用 drg logs --follow --config %s 查看统一日志。\n", status.PID, configPath)
 			return 0
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	fmt.Fprintf(errorOutput, "Gateway 未在 10 秒内就绪；请检查日志：%s\n", logPath)
+	fmt.Fprintf(errorOutput, "Gateway 未在 10 秒内就绪；请执行 drg logs --limit 100 --config %s，或以前台 serve 查看启动错误。\n", configPath)
 	return 1
 }
 
@@ -1907,8 +1912,8 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	return nil
 }
 
-func runEvents(ctx context.Context, arguments []string, input io.Reader, output, errorOutput io.Writer) int {
-	flags := flag.NewFlagSet("events", flag.ContinueOnError)
+func runLogs(ctx context.Context, command string, arguments []string, input io.Reader, output, errorOutput io.Writer) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	limit := flags.Int("limit", 50, "最多显示的事件数量")
@@ -1916,13 +1921,13 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 	colorMode := flags.String("color", "auto", "颜色：auto、always 或 never")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || *limit < 1 {
 		if err == nil {
-			fmt.Fprintln(errorOutput, "events 不接受位置参数，且 limit 必须大于零")
+			fmt.Fprintf(errorOutput, "%s 不接受位置参数，且 limit 必须大于零\n", command)
 		}
 		return 2
 	}
 	color, colorErr := eventColorEnabled(*colorMode, output)
 	if colorErr != nil {
-		fmt.Fprintf(errorOutput, "events 颜色模式无效: %v\n", colorErr)
+		fmt.Fprintf(errorOutput, "%s 颜色模式无效: %v\n", command, colorErr)
 		return 2
 	}
 	loaded, err := config.LoadFile(*configPath)
@@ -1932,7 +1937,7 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 	}
 	eventRetention, _, err := retentionConfiguration(loaded)
 	if err != nil {
-		fmt.Fprintf(errorOutput, "读取事件日志保留配置失败: %v\n", err)
+		fmt.Fprintf(errorOutput, "读取日志保留配置失败: %v\n", err)
 		return 1
 	}
 	log := eventlog.New(loaded.DataDir, time.Now, eventRetention)
@@ -1945,18 +1950,18 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 		cancelFollow()
 		waitForInput()
 		if err != nil {
-			fmt.Fprintf(errorOutput, "跟随事件日志失败: %v\n", err)
+			fmt.Fprintf(errorOutput, "跟随日志失败: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	events, err := log.Read(*limit)
 	if err != nil {
-		fmt.Fprintf(errorOutput, "读取事件日志失败: %v\n", err)
+		fmt.Fprintf(errorOutput, "读取日志失败: %v\n", err)
 		return 1
 	}
 	if len(events) == 0 {
-		fmt.Fprintln(output, "暂无事件。")
+		fmt.Fprintln(output, "暂无日志。")
 		return 0
 	}
 	for _, event := range events {
@@ -2024,6 +2029,43 @@ func startFollowSeparators(ctx context.Context, input io.Reader, printer *follow
 func isProcessStdin(input io.Reader) bool {
 	file, isFile := input.(*os.File)
 	return isFile && file == os.Stdin
+}
+
+// serviceLogger is the single seam between Gateway lifecycle output and the
+// bounded diagnostic history. It intentionally records only caller-supplied,
+// non-secret messages, never raw upstream errors.
+type serviceLogger struct {
+	mu     sync.Mutex
+	events *eventlog.Log
+	output io.Writer
+}
+
+func newServiceLogger(events *eventlog.Log, output io.Writer) *serviceLogger {
+	return &serviceLogger{events: events, output: output}
+}
+
+func (logger *serviceLogger) log(level, code, message string) {
+	if logger == nil {
+		return
+	}
+	event := eventlog.Event{Level: level, Code: code, Message: message}
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	if logger.events != nil {
+		_ = logger.events.Write(event)
+	}
+	if logger.output != nil {
+		printEvent(logger.output, event, false)
+	}
+}
+
+func (logger *serviceLogger) Write(contents []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(contents), "\r\n"), "\n") {
+		if message := strings.TrimSpace(line); message != "" {
+			logger.log("info", "server_notice", message)
+		}
+	}
+	return len(contents), nil
 }
 
 func eventColorEnabled(mode string, output io.Writer) (bool, error) {
@@ -2365,7 +2407,8 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  doctor  只读诊断配置、TLS、Docker 根信任、监听和 Provider")
 	fmt.Fprintln(output, "  tls reconcile|rotate-root|clear-previous-root  对账、两阶段轮换或显式清理本地 CA")
 	fmt.Fprintln(output, "  provider list|add|remove  查看或维护上游 Provider")
-	fmt.Fprintln(output, "  events [--follow] [--color auto|always|never]  查看事件；跟随时按回车插入空白分隔行")
+	fmt.Fprintln(output, "  logs [--follow] [--color auto|always|never]  查看统一日志；跟随时按回车插入空白分隔行")
+	fmt.Fprintln(output, "  events  兼容别名，等同于 logs")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
 	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
 	fmt.Fprintln(output, "  status  查看本地 Gateway 运行状态")

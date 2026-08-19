@@ -38,9 +38,9 @@ drg provider list
 drg provider add --name mirror-a --url https://example.invalid --pull-provider
 drg reload                         # 校验后热加载；仅影响新请求
 drg status
-drg events --limit 50
-drg events --follow --limit 50       # 先显示最近事件，再持续跟随；回车分隔，Ctrl+C 退出
-drg events --follow --color always   # 强制彩色输出；默认 auto 仅在终端启用
+drg logs --limit 50
+drg logs --follow --limit 50         # 先显示最近日志，再持续跟随；回车分隔，Ctrl+C 退出
+drg logs --follow --color always     # 强制彩色输出；默认 auto 仅在终端启用
 drg stop                           # 显示排空进度，最长等待 30 秒
 drg stop --force                   # 立即中断活跃拉取
 drg tls reconcile
@@ -49,7 +49,7 @@ drg tls rotate-root --activate     # 容器部署时，在宿主机完成手动�
 drg tls clear-previous-root        # 完成旧根 Docker 信任清理后，显式解除下一次轮换锁定
 ```
 
-大 blob 启动分片下载时，`drg events --follow` 会输出 `segmented_download_started`，其中包含逻辑分片数量及各上游实际 Range；这可作为分片是否启用的直接诊断证据。
+大 blob 启动分片下载时，`drg logs --follow` 会输出 `segmented_download_started`，其中包含逻辑分片数量及各上游实际 Range；这可作为分片是否启用的直接诊断证据。`drg events` 暂时保留为兼容别名。
 
 ### 本地 CA 根轮换
 

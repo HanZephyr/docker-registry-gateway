@@ -167,6 +167,48 @@ providers:
 	}
 }
 
+func TestRunLogsShowsServiceAndRoutingRecords(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	log := eventlog.New(dataDir, time.Now)
+	for _, event := range []eventlog.Event{
+		{Level: "info", Code: "gateway_started", Message: "Gateway 已启动；监听：127.0.0.1:5443"},
+		{Level: "info", Code: "blob_source_selected", Provider: "mirror-a", Repository: "library/alpine", Message: "pull provider opened a blob stream"},
+	} {
+		if err := log.Write(event); err != nil {
+			t.Fatalf("write log: %v", err)
+		}
+	}
+
+	var output, errors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"logs", "--color", "never", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+		t.Fatalf("logs exit code = %d, stderr = %s", exitCode, errors.String())
+	}
+	for _, expected := range []string{"gateway_started", "Gateway 已启动", "blob_source_selected", "Provider=mirror-a"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("logs output lacks %q:\n%s", expected, output.String())
+		}
+	}
+}
+
 func stripANSIEscapeSequences(value string) string {
 	var plain strings.Builder
 	for index := 0; index < len(value); index++ {
@@ -182,7 +224,7 @@ func stripANSIEscapeSequences(value string) string {
 	return plain.String()
 }
 
-func TestRunEventsFollowStreamsNewRoutingEvents(t *testing.T) {
+func TestRunLogsFollowStreamsNewRoutingRecords(t *testing.T) {
 	dataDir := t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "drg.yaml")
 	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
@@ -214,7 +256,7 @@ providers:
 	var errors bytes.Buffer
 	exitCode := make(chan int, 1)
 	go func() {
-		exitCode <- cli.Run(context, []string{"events", "--follow", "--limit", "10", "--config", configPath}, strings.NewReader(""), output, &errors)
+		exitCode <- cli.Run(context, []string{"logs", "--follow", "--limit", "10", "--config", configPath}, strings.NewReader(""), output, &errors)
 	}()
 
 	waitForOutput(t, output, "gateway_started")
@@ -226,10 +268,10 @@ providers:
 	select {
 	case got := <-exitCode:
 		if got != 0 {
-			t.Errorf("events --follow exit code = %d, stderr = %s", got, errors.String())
+			t.Errorf("logs --follow exit code = %d, stderr = %s", got, errors.String())
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("events --follow did not stop after context cancellation")
+		t.Fatal("logs --follow did not stop after context cancellation")
 	}
 	for _, expected := range []string{"Provider=mirror-a", "Repository=library/alpine", "Digest=sha256:stable"} {
 		if !strings.Contains(output.String(), expected) {
@@ -690,6 +732,15 @@ providers:
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve did not stop after local control request")
+	}
+	var logsOutput, logsErrors bytes.Buffer
+	if exitCode := cli.Run(context.Background(), []string{"logs", "--color", "never", "--config", configPath}, strings.NewReader(""), &logsOutput, &logsErrors); exitCode != 0 {
+		t.Fatalf("logs exit code = %d, stderr = %s", exitCode, logsErrors.String())
+	}
+	for _, expected := range []string{"gateway_started", "gateway_ready", "gateway_stopped"} {
+		if !strings.Contains(logsOutput.String(), expected) {
+			t.Errorf("unified logs lack %q:\n%s", expected, logsOutput.String())
+		}
 	}
 }
 

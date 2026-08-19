@@ -132,7 +132,7 @@ Gateway 通过主配置定义全局并发拉取数、单 blob 最大并行分片
 
 ## File Retention（文件保留）
 
-Gateway 不依赖数据库，持久诊断数据使用有界文件保留。事件日志按大小滚动，默认最多保留 7 天或 100 MB，任一上限达到即删除最旧文件；健康历史按分钟聚合并默认保留 7 天。解析租约在到期时自动清理。所有保留上限可在主配置中调整。
+Gateway 不依赖数据库，持久诊断数据使用有界文件保留。统一日志按大小滚动，默认最多保留 7 天或 100 MB，任一上限达到即删除最旧文件；它同时记录服务生命周期、Provider 探测与拉取路由。健康历史按分钟聚合并默认保留 7 天。解析租约在到期时自动清理。所有保留上限可在主配置中调整。
 
 ## Resolution Decision（解析决策）
 
@@ -160,9 +160,9 @@ Gateway 对一个可变镜像引用选定的 manifest 或 index digest，以及�
 
 ## Pull Notice（拉取提示）
 
-Gateway 对本次拉取所作路由或解析决策的用户可见说明。CLI 事件日志是权威诊断入口；Gateway 发送的 Docker Warning header 仅为尽力而为的补充，绝不改变已成功拉取的内容。
+Gateway 对本次拉取所作路由或解析决策的用户可见说明。`drg logs` 统一日志是权威诊断入口；Gateway 发送的 Docker Warning header 仅为尽力而为的补充，绝不改变已成功拉取的内容。
 
-CLI 事件、健康历史和错误信息可记录镜像引用、digest、Provider 名称与脱敏后的上游 origin，以支持诊断；不得记录认证头、密码/PAT、Bearer token、Cookie、`secret_file` 内容或包含签名参数的完整重定向 URL。
+统一日志、健康历史和错误信息可记录镜像引用、digest、Provider 名称与脱敏后的上游 origin，以支持诊断；不得记录认证头、密码/PAT、Bearer token、Cookie、`secret_file` 内容或包含签名参数的完整重定向 URL。
 
 Gateway 对下游响应使用 OCI 所需头部的白名单：保留 `Content-Type`、`Docker-Content-Digest`、`Content-Length`、`Content-Range`、`ETag`、`Last-Modified` 和适用的 `Retry-After`，并可自行增加尽力而为的 `Warning`。上游的认证挑战、Cookie、重定向、跳数及其他未允许头部不向下游转发。
 
@@ -170,7 +170,7 @@ Gateway 对下游响应使用 OCI 所需头部的白名单：保留 `Content-Typ
 
 Provider 的近期探测和传输质量记录。Gateway 重启后保留历史指标供 CLI 查看，但不继承熔断状态；所有 Provider 进入待快速探测状态后再参与正常选路。
 
-Gateway 使用首字节时间、连续无进度时间和近期吞吐的滑动统计自适应判断 Provider 的速度与卡顿，不向使用者暴露一组下载超时或最低速率阈值。只有存在明显更优且可 Range 续传的候选源时才发生中途切换；每次判断和切换原因记录为 CLI 事件。
+Gateway 使用首字节时间、连续无进度时间和近期吞吐的滑动统计自适应判断 Provider 的速度与卡顿，不向使用者暴露一组下载超时或最低速率阈值。只有存在明显更优且可 Range 续传的候选源时才发生中途切换；每次判断和切换原因记录到统一日志。
 
 真实拉取产生的被动指标是健康判断的主要来源。主动探测仅用于启动后的快速确认、故障恢复与长期无真实流量时的低频保活，且只执行 V2、manifest 与 blob `Range: bytes=0-0` 验证；它遵守限流和资源预算，永不抢占真实拉取。
 
