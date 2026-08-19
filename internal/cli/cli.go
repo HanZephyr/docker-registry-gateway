@@ -672,13 +672,14 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 	events := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	eventObserver := router.ObserverFunc(func(event router.Event) {
 		_ = events.Write(eventlog.Event{
-			Level:      event.Level,
-			Code:       event.Code,
-			Provider:   event.Provider,
-			Repository: event.Repository,
-			Reference:  event.Reference,
-			Digest:     event.Digest,
-			Message:    event.Message,
+			Level:        event.Level,
+			Code:         event.Code,
+			Provider:     event.Provider,
+			Repository:   event.Repository,
+			Reference:    event.Reference,
+			Digest:       event.Digest,
+			ResumeOffset: event.ResumeOffset,
+			Message:      event.Message,
 		})
 	})
 	if certificateManager != nil {
@@ -1919,6 +1920,9 @@ func printEvent(output io.Writer, event eventlog.Event) {
 	}
 	if event.Digest != "" {
 		details = append(details, "Digest="+event.Digest)
+	}
+	if event.ResumeOffset != nil {
+		details = append(details, "ResumeOffset="+strconv.FormatInt(*event.ResumeOffset, 10)+"B")
 	}
 	context := ""
 	if len(details) > 0 {

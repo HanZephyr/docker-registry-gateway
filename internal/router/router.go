@@ -38,13 +38,14 @@ type Source struct {
 // Event is a non-secret routing observation for the local event log. It never
 // contains credentials, headers, or Provider redirect URLs.
 type Event struct {
-	Level      string
-	Code       string
-	Provider   string
-	Repository string
-	Reference  string
-	Digest     string
-	Message    string
+	Level        string
+	Code         string
+	Provider     string
+	Repository   string
+	Reference    string
+	Digest       string
+	ResumeOffset *int64
+	Message      string
 }
 
 // Observer receives routing events synchronously. Callers should make the
@@ -549,7 +550,8 @@ func (reader *resumableBlobReader) resume(buffer []byte, cause error) (int, erro
 			case errors.Is(cause, errProviderSlow):
 				reason = fmt.Sprintf("switched from %s because an available Provider had materially better recent throughput", previous)
 			}
-			reader.router.emit(Event{Level: "warning", Code: "blob_source_switched", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, Message: reason})
+			resumeOffset := reader.offset
+			reader.router.emit(Event{Level: "warning", Code: "blob_source_switched", Provider: source.Name, Repository: reader.repository, Digest: reader.digest, ResumeOffset: &resumeOffset, Message: reason})
 			return reader.Read(buffer)
 		}
 		if blob.Reader != nil {

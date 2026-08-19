@@ -148,14 +148,15 @@ providers:
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatalf("write configuration: %v", err)
 	}
-	if err := eventlog.New(dataDir, time.Now).Write(eventlog.Event{Level: "warning", Code: "blob_source_switched", Provider: "mirror-a", Repository: "library/nginx", Reference: "latest", Digest: "sha256:stable", Message: "resumed safely"}); err != nil {
+	resumeOffset := int64(4)
+	if err := eventlog.New(dataDir, time.Now).Write(eventlog.Event{Level: "warning", Code: "blob_source_switched", Provider: "mirror-a", Repository: "library/nginx", Reference: "latest", Digest: "sha256:stable", ResumeOffset: &resumeOffset, Message: "resumed safely"}); err != nil {
 		t.Fatalf("write event: %v", err)
 	}
 	var output, errors bytes.Buffer
 	if exitCode := cli.Run(context.Background(), []string{"events", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("events exit code = %d, stderr = %s", exitCode, errors.String())
 	}
-	for _, expected := range []string{"Provider=mirror-a", "Repository=library/nginx", "Reference=latest", "Digest=sha256:stable"} {
+	for _, expected := range []string{"Provider=mirror-a", "Repository=library/nginx", "Reference=latest", "Digest=sha256:stable", "ResumeOffset=4B"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Errorf("events output lacks %q:\n%s", expected, output.String())
 		}

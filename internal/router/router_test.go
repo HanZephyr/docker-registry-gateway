@@ -373,10 +373,11 @@ func TestBlobResumesFromNextRangeProviderAfterInterruptedRead(t *testing.T) {
 			Reader: io.NopCloser(strings.NewReader("456789")),
 		}, nil
 	}}
+	var events []router.Event
 	gateway := router.New([]router.Source{
 		{Name: "primary", PullProvider: true, Backend: primary},
 		{Name: "fallback", PullProvider: true, Backend: fallback},
-	}, router.Options{})
+	}, router.Options{Observer: router.ObserverFunc(func(event router.Event) { events = append(events, event) })})
 
 	blob, err := gateway.Blob(context.Background(), "library/nginx", blobDigest, "")
 	if err != nil {
@@ -390,6 +391,16 @@ func TestBlobResumesFromNextRangeProviderAfterInterruptedRead(t *testing.T) {
 	if got, want := string(contents), "0123456789"; got != want {
 		t.Errorf("resumed blob = %q, want %q", got, want)
 	}
+	for _, event := range events {
+		if event.Code != "blob_source_switched" {
+			continue
+		}
+		if event.ResumeOffset == nil || *event.ResumeOffset != 4 {
+			t.Errorf("resume offset = %v, want 4", event.ResumeOffset)
+		}
+		return
+	}
+	t.Errorf("events = %#v, want a resume switch event", events)
 }
 
 func TestBlobSwitchesAwayFromStalledProviderAndResumesAtExactOffset(t *testing.T) {

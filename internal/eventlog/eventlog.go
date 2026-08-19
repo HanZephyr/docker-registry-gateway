@@ -25,14 +25,15 @@ const (
 
 // Event intentionally excludes headers, credentials, tokens and redirect URLs.
 type Event struct {
-	Time       time.Time `json:"time"`
-	Level      string    `json:"level"`
-	Code       string    `json:"code"`
-	Provider   string    `json:"provider,omitempty"`
-	Repository string    `json:"repository,omitempty"`
-	Reference  string    `json:"reference,omitempty"`
-	Digest     string    `json:"digest,omitempty"`
-	Message    string    `json:"message"`
+	Time         time.Time `json:"time"`
+	Level        string    `json:"level"`
+	Code         string    `json:"code"`
+	Provider     string    `json:"provider,omitempty"`
+	Repository   string    `json:"repository,omitempty"`
+	Reference    string    `json:"reference,omitempty"`
+	Digest       string    `json:"digest,omitempty"`
+	ResumeOffset *int64    `json:"resume_offset,omitempty"`
+	Message      string    `json:"message"`
 }
 
 // Log appends events to a bounded daily JSONL history.
