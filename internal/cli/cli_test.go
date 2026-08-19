@@ -153,14 +153,33 @@ providers:
 		t.Fatalf("write event: %v", err)
 	}
 	var output, errors bytes.Buffer
-	if exitCode := cli.Run(context.Background(), []string{"events", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
+	if exitCode := cli.Run(context.Background(), []string{"events", "--color", "always", "--config", configPath}, strings.NewReader(""), &output, &errors); exitCode != 0 {
 		t.Fatalf("events exit code = %d, stderr = %s", exitCode, errors.String())
 	}
+	plainOutput := stripANSIEscapeSequences(output.String())
 	for _, expected := range []string{"Provider=mirror-a", "Repository=library/nginx", "Reference=latest", "Digest=sha256:stable", "ResumeOffset=4B"} {
-		if !strings.Contains(output.String(), expected) {
+		if !strings.Contains(plainOutput, expected) {
 			t.Errorf("events output lacks %q:\n%s", expected, output.String())
 		}
 	}
+	if !strings.Contains(output.String(), "\x1b[33mwarning\x1b[0m") {
+		t.Errorf("events output = %q, want a colored warning level", output.String())
+	}
+}
+
+func stripANSIEscapeSequences(value string) string {
+	var plain strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] == '\x1b' && index+1 < len(value) && value[index+1] == '[' {
+			index += 2
+			for index < len(value) && (value[index] < 0x40 || value[index] > 0x7e) {
+				index++
+			}
+			continue
+		}
+		plain.WriteByte(value[index])
+	}
+	return plain.String()
 }
 
 func TestRunEventsFollowStreamsNewRoutingEvents(t *testing.T) {

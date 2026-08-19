@@ -40,6 +40,7 @@ drg reload                         # 校验后热加载；仅影响新请求
 drg status
 drg events --limit 50
 drg events --follow --limit 50       # 先显示最近事件，再持续跟随；回车分隔，Ctrl+C 退出
+drg events --follow --color always   # 强制彩色输出；默认 auto 仅在终端启用
 drg stop                           # 显示排空进度，最长等待 30 秒
 drg stop --force                   # 立即中断活跃拉取
 drg tls reconcile

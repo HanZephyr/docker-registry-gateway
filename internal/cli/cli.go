@@ -1801,10 +1801,16 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	limit := flags.Int("limit", 50, "最多显示的事件数量")
 	follow := flags.Bool("follow", false, "先显示最近事件，再持续跟随新事件")
+	colorMode := flags.String("color", "auto", "颜色：auto、always 或 never")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || *limit < 1 {
 		if err == nil {
 			fmt.Fprintln(errorOutput, "events 不接受位置参数，且 limit 必须大于零")
 		}
+		return 2
+	}
+	color, colorErr := eventColorEnabled(*colorMode, output)
+	if colorErr != nil {
+		fmt.Fprintf(errorOutput, "events 颜色模式无效: %v\n", colorErr)
 		return 2
 	}
 	loaded, err := config.LoadFile(*configPath)
@@ -1820,7 +1826,7 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 	log := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	if *follow {
 		followContext, cancelFollow := context.WithCancel(ctx)
-		printer := &followEventPrinter{output: output}
+		printer := &followEventPrinter{output: output, color: color}
 		waitForInput := startFollowSeparators(followContext, input, printer)
 		err := log.Follow(followContext, *limit, printer.print)
 		printer.close()
@@ -1842,7 +1848,7 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 		return 0
 	}
 	for _, event := range events {
-		printEvent(output, event)
+		printEvent(output, event, color)
 	}
 	return 0
 }
@@ -1850,6 +1856,7 @@ func runEvents(ctx context.Context, arguments []string, input io.Reader, output,
 type followEventPrinter struct {
 	mu     sync.Mutex
 	output io.Writer
+	color  bool
 	closed bool
 }
 
@@ -1859,7 +1866,7 @@ func (printer *followEventPrinter) print(event eventlog.Event) {
 	if printer.closed {
 		return
 	}
-	printEvent(printer.output, event)
+	printEvent(printer.output, event, printer.color)
 }
 
 func (printer *followEventPrinter) separator() {
@@ -1907,28 +1914,88 @@ func isProcessStdin(input io.Reader) bool {
 	return isFile && file == os.Stdin
 }
 
-func printEvent(output io.Writer, event eventlog.Event) {
+func eventColorEnabled(mode string, output io.Writer) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	case "auto":
+		if os.Getenv("NO_COLOR") != "" {
+			return false, nil
+		}
+		file, isFile := output.(*os.File)
+		if !isFile {
+			return false, nil
+		}
+		info, err := file.Stat()
+		return err == nil && info.Mode()&os.ModeCharDevice != 0, nil
+	default:
+		return false, fmt.Errorf("%q（可选 auto、always、never）", mode)
+	}
+}
+
+const (
+	ansiReset   = "\x1b[0m"
+	ansiDim     = "\x1b[2m"
+	ansiCyan    = "\x1b[36m"
+	ansiYellow  = "\x1b[33m"
+	ansiRed     = "\x1b[31m"
+	ansiMagenta = "\x1b[35m"
+	ansiBold    = "\x1b[1m"
+)
+
+func printEvent(output io.Writer, event eventlog.Event, color bool) {
 	var details []string
 	if event.Provider != "" {
-		details = append(details, "Provider="+event.Provider)
+		details = append(details, formatEventDetail("Provider", event.Provider, ansiMagenta, color))
 	}
 	if event.Repository != "" {
-		details = append(details, "Repository="+event.Repository)
+		details = append(details, formatEventDetail("Repository", event.Repository, ansiCyan, color))
 	}
 	if event.Reference != "" {
-		details = append(details, "Reference="+event.Reference)
+		details = append(details, formatEventDetail("Reference", event.Reference, ansiCyan, color))
 	}
 	if event.Digest != "" {
-		details = append(details, "Digest="+event.Digest)
+		details = append(details, formatEventDetail("Digest", event.Digest, ansiDim, color))
 	}
 	if event.ResumeOffset != nil {
-		details = append(details, "ResumeOffset="+strconv.FormatInt(*event.ResumeOffset, 10)+"B")
+		details = append(details, formatEventDetail("ResumeOffset", strconv.FormatInt(*event.ResumeOffset, 10)+"B", ansiBold, color))
 	}
 	context := ""
 	if len(details) > 0 {
 		context = " " + strings.Join(details, " ")
 	}
-	fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, context, event.Message)
+	levelStyle := eventLevelStyle(event.Level)
+	fmt.Fprintf(output, "%s [%s] %s%s：%s\n",
+		colorize(event.Time.Local().Format(time.RFC3339), ansiDim, color),
+		colorize(event.Level, levelStyle, color),
+		colorize(event.Code, ansiBold+levelStyle, color),
+		context,
+		event.Message,
+	)
+}
+
+func eventLevelStyle(level string) string {
+	switch strings.ToLower(level) {
+	case "error":
+		return ansiRed
+	case "warning":
+		return ansiYellow
+	default:
+		return ansiCyan
+	}
+}
+
+func formatEventDetail(key, value, style string, color bool) string {
+	return key + "=" + colorize(value, style, color)
+}
+
+func colorize(value, style string, enabled bool) string {
+	if !enabled || value == "" {
+		return value
+	}
+	return style + value + ansiReset
 }
 
 func printSecurityWarnings(output io.Writer, loaded config.Config) {
@@ -2186,7 +2253,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  doctor  只读诊断配置、TLS、Docker 根信任、监听和 Provider")
 	fmt.Fprintln(output, "  tls reconcile|rotate-root|clear-previous-root  对账、两阶段轮换或显式清理本地 CA")
 	fmt.Fprintln(output, "  provider list|add|remove  查看或维护上游 Provider")
-	fmt.Fprintln(output, "  events [--follow]  查看事件；跟随时按回车插入空白分隔行")
+	fmt.Fprintln(output, "  events [--follow] [--color auto|always|never]  查看事件；跟随时按回车插入空白分隔行")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
 	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
 	fmt.Fprintln(output, "  status  查看本地 Gateway 运行状态")
