@@ -55,7 +55,7 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 	case "doctor":
 		return runDoctor(ctx, arguments[1:], output, errorOutput)
 	case "events":
-		return runEvents(ctx, arguments[1:], output, errorOutput)
+		return runEvents(ctx, arguments[1:], input, output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
 	case "start":
@@ -1794,7 +1794,7 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	return nil
 }
 
-func runEvents(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
+func runEvents(ctx context.Context, arguments []string, input io.Reader, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("events", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
@@ -1818,7 +1818,14 @@ func runEvents(ctx context.Context, arguments []string, output, errorOutput io.W
 	}
 	log := eventlog.New(loaded.DataDir, time.Now, eventRetention)
 	if *follow {
-		if err := log.Follow(ctx, *limit, func(event eventlog.Event) { printEvent(output, event) }); err != nil {
+		followContext, cancelFollow := context.WithCancel(ctx)
+		printer := &followEventPrinter{output: output}
+		waitForInput := startFollowSeparators(followContext, input, printer)
+		err := log.Follow(followContext, *limit, printer.print)
+		printer.close()
+		cancelFollow()
+		waitForInput()
+		if err != nil {
 			fmt.Fprintf(errorOutput, "跟随事件日志失败: %v\n", err)
 			return 1
 		}
@@ -1837,6 +1844,66 @@ func runEvents(ctx context.Context, arguments []string, output, errorOutput io.W
 		printEvent(output, event)
 	}
 	return 0
+}
+
+type followEventPrinter struct {
+	mu     sync.Mutex
+	output io.Writer
+	closed bool
+}
+
+func (printer *followEventPrinter) print(event eventlog.Event) {
+	printer.mu.Lock()
+	defer printer.mu.Unlock()
+	if printer.closed {
+		return
+	}
+	printEvent(printer.output, event)
+}
+
+func (printer *followEventPrinter) separator() {
+	printer.mu.Lock()
+	defer printer.mu.Unlock()
+	if printer.closed {
+		return
+	}
+	fmt.Fprintln(printer.output)
+}
+
+func (printer *followEventPrinter) close() {
+	printer.mu.Lock()
+	defer printer.mu.Unlock()
+	printer.closed = true
+}
+
+func startFollowSeparators(ctx context.Context, input io.Reader, printer *followEventPrinter) func() {
+	if input == nil || printer == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	waitForScanner := false
+	if closer, closable := input.(io.Closer); closable && !isProcessStdin(input) {
+		waitForScanner = true
+		context.AfterFunc(ctx, func() { _ = closer.Close() })
+	}
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(input)
+		for scanner.Scan() {
+			if scanner.Text() == "" {
+				printer.separator()
+			}
+		}
+	}()
+	if !waitForScanner {
+		return func() {}
+	}
+	return func() { <-done }
+}
+
+func isProcessStdin(input io.Reader) bool {
+	file, isFile := input.(*os.File)
+	return isFile && file == os.Stdin
 }
 
 func printEvent(output io.Writer, event eventlog.Event) {
@@ -2115,7 +2182,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  doctor  只读诊断配置、TLS、Docker 根信任、监听和 Provider")
 	fmt.Fprintln(output, "  tls reconcile|rotate-root|clear-previous-root  对账、两阶段轮换或显式清理本地 CA")
 	fmt.Fprintln(output, "  provider list|add|remove  查看或维护上游 Provider")
-	fmt.Fprintln(output, "  events [--follow]  查看事件，或持续跟随新的诊断事件")
+	fmt.Fprintln(output, "  events [--follow]  查看事件；跟随时按回车插入空白分隔行")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
 	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
 	fmt.Fprintln(output, "  status  查看本地 Gateway 运行状态")

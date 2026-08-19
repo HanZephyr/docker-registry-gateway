@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -214,6 +215,123 @@ providers:
 		if !strings.Contains(output.String(), expected) {
 			t.Errorf("events --follow output lacks %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestRunEventsFollowPrintsBlankSeparatorOnEnter(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	if err := eventlog.New(dataDir, time.Now).Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway started"}); err != nil {
+		t.Fatalf("write initial event: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input, enter := io.Pipe()
+	defer input.Close()
+	defer enter.Close()
+	output := &synchronizedBuffer{}
+	var errors bytes.Buffer
+	exitCode := make(chan int, 1)
+	go func() {
+		exitCode <- cli.Run(ctx, []string{"events", "--follow", "--config", configPath}, input, output, &errors)
+	}()
+
+	waitForOutput(t, output, "gateway_started")
+	sent := make(chan error, 1)
+	go func() {
+		_, err := enter.Write([]byte("\n"))
+		sent <- err
+	}()
+	waitForOutput(t, output, "Gateway started\n\n")
+	if err := <-sent; err != nil {
+		t.Fatalf("send enter: %v", err)
+	}
+	if err := enter.Close(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	cancel()
+	select {
+	case got := <-exitCode:
+		if got != 0 {
+			t.Errorf("events --follow exit code = %d, stderr = %s", got, errors.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events --follow did not stop after context cancellation")
+	}
+}
+
+func TestRunEventsFollowStopsReadingInputAfterCancellation(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	if err := eventlog.New(dataDir, time.Now).Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway started"}); err != nil {
+		t.Fatalf("write initial event: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	input, enter := io.Pipe()
+	defer input.Close()
+	defer enter.Close()
+	output := &synchronizedBuffer{}
+	var errors bytes.Buffer
+	exitCode := make(chan int, 1)
+	go func() {
+		exitCode <- cli.Run(ctx, []string{"events", "--follow", "--config", configPath}, input, output, &errors)
+	}()
+
+	waitForOutput(t, output, "gateway_started")
+	cancel()
+	select {
+	case got := <-exitCode:
+		if got != 0 {
+			t.Errorf("events --follow exit code = %d, stderr = %s", got, errors.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events --follow did not stop after context cancellation")
+	}
+	before := output.String()
+	if _, err := enter.Write([]byte("\n")); err == nil {
+		t.Fatal("follow input remained open after command cancellation")
+	}
+	if got := output.String(); got != before {
+		t.Errorf("output changed after cancellation:\n%s", got)
 	}
 }
 
