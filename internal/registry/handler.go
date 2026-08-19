@@ -177,7 +177,15 @@ func (value handler) serveBlob(response http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	blob, err := value.backend.Blob(request.Context(), repository, digest, request.Header.Get("Range"))
+	downstreamRange := request.Header.Get("Range")
+	metadataProbe := request.Method == http.MethodHead && downstreamRange == ""
+	upstreamRange := downstreamRange
+	if metadataProbe {
+		// A bare HEAD needs only immutable metadata. Request one byte upstream so
+		// Router does not allocate segmented downloads for a body we will not send.
+		upstreamRange = "bytes=0-0"
+	}
+	blob, err := value.backend.Blob(request.Context(), repository, digest, upstreamRange)
 	if err != nil {
 		writeBackendError(response, err, "BLOB_UNKNOWN")
 		return
@@ -192,12 +200,15 @@ func (value handler) serveBlob(response http.ResponseWriter, request *http.Reque
 		return
 	}
 	contentLength := blob.End - blob.Start + 1
+	if metadataProbe {
+		contentLength = blob.Size
+	}
 	response.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
 	response.Header().Set("Content-Type", "application/octet-stream")
 	response.Header().Set("Docker-Content-Digest", blob.Digest)
 	response.Header().Set("Accept-Ranges", "bytes")
 	response.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
-	if request.Header.Get("Range") != "" {
+	if downstreamRange != "" {
 		response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", blob.Start, blob.End, blob.Size))
 		response.WriteHeader(http.StatusPartialContent)
 	} else {

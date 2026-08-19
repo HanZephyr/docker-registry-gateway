@@ -235,6 +235,50 @@ func TestBlobDownloadsLargeFullRangeInTemporarySegments(t *testing.T) {
 	}
 }
 
+func TestBlobRecordsSegmentedDownloadPlan(t *testing.T) {
+	t.Parallel()
+
+	contents := bytes.Repeat([]byte("0123456789abcdef"), 16<<10)
+	backend := &rangeBackend{contents: contents}
+	var events []router.Event
+	var eventsMu sync.Mutex
+	gateway := router.New([]router.Source{{Name: "range", PullProvider: true, Backend: backend}}, router.Options{
+		MaxSegmentsPerBlob: 3,
+		MinSegmentSize:     64 << 10,
+		TemporaryDir:       filepath.Join(t.TempDir(), "segments"),
+		TempBudget:         router.NewTempBudget(int64(len(contents)) * 2),
+		Observer: router.ObserverFunc(func(event router.Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, event)
+		}),
+	})
+
+	blob, err := gateway.Blob(context.Background(), "library/nginx", "sha256:blob", "")
+	if err != nil {
+		t.Fatalf("Blob() error = %v", err)
+	}
+	if _, err := io.ReadAll(blob.Reader); err != nil {
+		t.Fatalf("read segmented blob: %v", err)
+	}
+	if err := blob.Reader.Close(); err != nil {
+		t.Fatalf("close segmented blob: %v", err)
+	}
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	for _, event := range events {
+		if event.Code != "segmented_download_started" {
+			continue
+		}
+		if got, want := event.Message, "segments=3; ranges=bytes=0-87380,bytes=21845-174761,bytes=109226-262143"; got != want {
+			t.Errorf("segmented download message = %q, want %q", got, want)
+		}
+		return
+	}
+	t.Errorf("events = %#v, want segmented download plan", events)
+}
+
 func TestBlobAbortsWhenSegmentOverlapDisagrees(t *testing.T) {
 	t.Parallel()
 

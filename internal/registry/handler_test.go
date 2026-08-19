@@ -8,11 +8,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
 	"github.com/hjx/docker-registry-gateway/internal/routeguard"
+	"github.com/hjx/docker-registry-gateway/internal/router"
 )
 
 func TestHandlerServesV2ManifestAndRangedBlob(t *testing.T) {
@@ -107,6 +111,68 @@ func TestHandlerAbortsFullBlobResponseWhenDigestDoesNotMatch(t *testing.T) {
 	handler.ServeHTTP(response, request)
 }
 
+func TestHandlerUsesMetadataProbeForUnrangedBlobHead(t *testing.T) {
+	t.Parallel()
+
+	blob := bytes.Repeat([]byte("x"), 128)
+	backend := &rangeRecordingBackend{blob: blob, blobDigest: digest(blob)}
+	handler := registry.NewHandler(backend)
+	request := httptest.NewRequest(http.MethodHead, "https://drg.localhost:5443/v2/library/nginx/blobs/"+backend.blobDigest, nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+	if got, want := response.Header().Get("Content-Length"), "128"; got != want {
+		t.Errorf("Content-Length = %q, want %q", got, want)
+	}
+	if got := response.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range = %q, want no downstream range response", got)
+	}
+	if got := response.Body.Len(); got != 0 {
+		t.Errorf("HEAD body length = %d, want 0", got)
+	}
+	if got, want := backend.rangeCalls(), []string{"bytes=0-0"}; !slices.Equal(got, want) {
+		t.Errorf("backend ranges = %q, want %q", got, want)
+	}
+}
+
+func TestHandlerHeadDoesNotStartSegmentedDownload(t *testing.T) {
+	t.Parallel()
+
+	blob := bytes.Repeat([]byte("x"), 256<<10)
+	backend := &rangeRecordingBackend{blob: blob, blobDigest: digest(blob)}
+	var events []router.Event
+	var eventsMu sync.Mutex
+	routed := router.New([]router.Source{{Name: "range", PullProvider: true, Backend: backend}}, router.Options{
+		MaxSegmentsPerBlob: 3,
+		MinSegmentSize:     64 << 10,
+		TemporaryDir:       filepath.Join(t.TempDir(), "segments"),
+		TempBudget:         router.NewTempBudget(int64(len(blob)) * 2),
+		Observer: router.ObserverFunc(func(event router.Event) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, event)
+		}),
+	})
+	handler := registry.NewHandler(routed)
+	request := httptest.NewRequest(http.MethodHead, "https://drg.localhost:5443/v2/library/nginx/blobs/"+backend.blobDigest, nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if got, want := response.Code, http.StatusOK; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	if containsRouterEvent(events, "segmented_download_started") {
+		t.Errorf("events = %#v, want no segmented download for HEAD", events)
+	}
+}
+
 func TestHandlerRejectsGatewayRouteThatReturnsToThisInstance(t *testing.T) {
 	backend := &countingBackend{}
 	var events []registry.HandlerEvent
@@ -186,6 +252,62 @@ func (backend *countingBackend) Blob(_ context.Context, _, _, _ string) (registr
 }
 
 type errorBackend struct{ err error }
+
+type rangeRecordingBackend struct {
+	blob       []byte
+	blobDigest string
+	mu         sync.Mutex
+	calls      []string
+}
+
+func (backend *rangeRecordingBackend) Manifest(context.Context, string, string, []string) (registry.Manifest, error) {
+	return registry.Manifest{}, registry.ErrNotFound
+}
+
+func (backend *rangeRecordingBackend) Blob(_ context.Context, repository, requestedDigest, rangeHeader string) (registry.Blob, error) {
+	if repository != "library/nginx" || requestedDigest != backend.blobDigest {
+		return registry.Blob{}, registry.ErrNotFound
+	}
+	backend.mu.Lock()
+	backend.calls = append(backend.calls, rangeHeader)
+	backend.mu.Unlock()
+	end := int64(len(backend.blob) - 1)
+	if rangeHeader != "" {
+		var start int64
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil || start < 0 || end < start || end >= int64(len(backend.blob)) {
+			return registry.Blob{}, registry.ErrNotFound
+		}
+		return registry.Blob{
+			Digest: backend.blobDigest,
+			Size:   int64(len(backend.blob)),
+			Start:  start,
+			End:    end,
+			Reader: io.NopCloser(bytes.NewReader(backend.blob[start : end+1])),
+		}, nil
+	}
+	return registry.Blob{
+		Digest: backend.blobDigest,
+		Size:   int64(len(backend.blob)),
+		Start:  0,
+		End:    end,
+		Reader: io.NopCloser(bytes.NewReader(backend.blob[:end+1])),
+	}, nil
+}
+
+func (backend *rangeRecordingBackend) rangeCalls() []string {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]string(nil), backend.calls...)
+}
+
+func containsRouterEvent(events []router.Event, code string) bool {
+	for _, event := range events {
+		if event.Code == code {
+			return true
+		}
+	}
+	return false
+}
 
 func (backend errorBackend) Manifest(context.Context, string, string, []string) (registry.Manifest, error) {
 	return registry.Manifest{}, backend.err

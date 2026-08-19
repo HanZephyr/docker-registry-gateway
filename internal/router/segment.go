@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/hjx/docker-registry-gateway/internal/registry"
@@ -65,11 +66,19 @@ func (router *Router) trySegmentedBlob(ctx context.Context, repository, digest s
 	if !acquired {
 		return registry.Blob{}, false
 	}
+	ranges := segmentRanges(segments)
 	reader, err := router.startSegmentDownloads(ctx, repository, digest, metadata.Size, segments, release)
 	if err != nil {
 		release()
 		return registry.Blob{}, false
 	}
+	router.emit(Event{
+		Level:      "info",
+		Code:       "segmented_download_started",
+		Repository: repository,
+		Digest:     digest,
+		Message:    fmt.Sprintf("segments=%d; ranges=%s", len(segments), ranges),
+	})
 	return registry.Blob{Digest: digest, Size: metadata.Size, Start: 0, End: metadata.Size - 1, Reader: reader}, true
 }
 
@@ -121,6 +130,14 @@ func segmentStorageBytes(segments []segment) int64 {
 		total += length
 	}
 	return total
+}
+
+func segmentRanges(segments []segment) string {
+	ranges := make([]string, len(segments))
+	for index, segment := range segments {
+		ranges[index] = fmt.Sprintf("bytes=%d-%d", segment.physicalStart, segment.end)
+	}
+	return strings.Join(ranges, ",")
 }
 
 func (router *Router) startSegmentDownloads(parent context.Context, repository, digest string, size int64, segments []segment, release func()) (*segmentedReader, error) {

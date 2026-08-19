@@ -48,6 +48,8 @@ drg tls rotate-root --activate     # 容器部署时，在宿主机完成手动�
 drg tls clear-previous-root        # 完成旧根 Docker 信任清理后，显式解除下一次轮换锁定
 ```
 
+大 blob 启动分片下载时，`drg events --follow` 会输出 `segmented_download_started`，其中包含逻辑分片数量及各上游实际 Range；这可作为分片是否启用的直接诊断证据。
+
 ### 本地 CA 根轮换
 
 `drg tls rotate-root` 绝不会先切换服务端证书再尝试安装 Docker 信任。它先将 `ca.next.crt` 作为额外信任根安装；成功后才激活新根和新叶证书，并保留旧根为 `ca.previous.crt`。容器内运行时，DRG 不会猜测宿主机路径：它会停在“待激活”状态、输出宿主机操作说明，用户完成信任安装后执行带 `--activate` 的同一命令。
