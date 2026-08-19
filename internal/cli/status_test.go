@@ -97,6 +97,15 @@ func TestFormatStatusAlignsEmojiNamesAndEscapesControlCharacters(t *testing.T) {
 	}
 }
 
+func TestFormatStatusKeepsEmptyProviderSectionBoxed(t *testing.T) {
+	output := formatStatus(control.Status{State: "running"})
+	for _, expected := range []string{"Providers\n", "┌", "│ Provider", "暂无 Provider 健康记录", "└"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("empty Provider table lacks %q:\n%s", expected, output)
+		}
+	}
+}
+
 func findStatusLine(t *testing.T, lines []string, contains string) string {
 	t.Helper()
 	for _, line := range lines {

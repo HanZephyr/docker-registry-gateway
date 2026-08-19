@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -732,6 +733,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 				_ = events.Write(eventlog.Event{Level: event.Level, Code: event.Code, Message: event.Message})
 			},
 		}), loaded.Resources.MaxInflightRequests),
+		ErrorLog: log.New(httpServiceErrorWriter{logger: serviceLogs}, "", 0),
 	}
 	if certificateManager != nil {
 		server.TLSConfig = &tls.Config{GetCertificate: certificateManager.GetCertificate, MinVersion: tls.VersionTLS12}
@@ -744,7 +746,7 @@ func runServe(ctx context.Context, arguments []string, output, errorOutput io.Wr
 			for _, opened := range listeners {
 				opened.Close()
 			}
-			serviceLogs.log("error", "listener_open_failed", "监听地址失败；Gateway 未启动")
+			serviceLogs.log("error", "listener_open_failed", "监听地址 "+address+" 失败；Gateway 未启动")
 			fmt.Fprintf(errorOutput, "监听 %s 失败: %v\n", address, err)
 			return 1
 		}
@@ -1255,12 +1257,12 @@ func formatStatus(status control.Status) string {
 		{"排队拉取", strconv.Itoa(status.QueuedPulls)},
 	})
 	output.WriteString("\nProviders\n")
+	headers := []string{"Provider", "状态", "吞吐", "首字节", "失败", "最近成功", "最近失败"}
 	if len(status.Providers) == 0 {
-		output.WriteString("  无\n")
+		writeStatusTable(&output, headers, [][]string{{"—", "暂无 Provider 健康记录", "", "", "", "", ""}})
 		return output.String()
 	}
 
-	headers := []string{"Provider", "状态", "吞吐", "首字节", "失败", "最近成功", "最近失败"}
 	rows := make([][]string, 0, len(status.Providers))
 	for _, provider := range status.Providers {
 		rows = append(rows, []string{
@@ -2064,6 +2066,19 @@ func (logger *serviceLogger) Write(contents []byte) (int, error) {
 		if message := strings.TrimSpace(line); message != "" {
 			logger.log("info", "server_notice", message)
 		}
+	}
+	return len(contents), nil
+}
+
+// httpServiceErrorWriter converts net/http's unstructured stderr output into a
+// safe, actionable unified-log category without persisting request text.
+type httpServiceErrorWriter struct {
+	logger *serviceLogger
+}
+
+func (writer httpServiceErrorWriter) Write(contents []byte) (int, error) {
+	if writer.logger != nil {
+		writer.logger.log("warning", "http_server_error", "HTTP 服务发生连接、协议或处理错误；受影响请求可能已中断")
 	}
 	return len(contents), nil
 }
