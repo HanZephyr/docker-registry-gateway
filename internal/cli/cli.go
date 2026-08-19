@@ -21,6 +21,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	"github.com/mattn/go-runewidth"
 
 	"github.com/hjx/docker-registry-gateway/internal/certmanager"
 	"github.com/hjx/docker-registry-gateway/internal/config"
@@ -1223,19 +1226,107 @@ func runStatus(ctx context.Context, arguments []string, output, errorOutput io.W
 		fmt.Fprintf(errorOutput, "读取运行状态失败: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(output, "状态：%s；PID：%d；活跃拉取：%d；排队拉取：%d；监听：%s\n", status.State, status.PID, status.ActivePulls, status.QueuedPulls, strings.Join(status.Listeners, ", "))
+	fmt.Fprint(output, formatStatus(status))
+	return 0
+}
+
+func formatStatus(status control.Status) string {
+	var output strings.Builder
+	output.WriteString("Gateway\n")
+	writeStatusSummary(&output, [][2]string{
+		{"状态", status.State},
+		{"PID", strconv.Itoa(status.PID)},
+		{"监听地址", strings.Join(status.Listeners, ", ")},
+		{"活跃拉取", strconv.Itoa(status.ActivePulls)},
+		{"排队拉取", strconv.Itoa(status.QueuedPulls)},
+	})
+	output.WriteString("\nProviders\n")
+	if len(status.Providers) == 0 {
+		output.WriteString("  无\n")
+		return output.String()
+	}
+
+	headers := []string{"Provider", "状态", "吞吐", "首字节", "失败", "最近成功", "最近失败"}
+	rows := make([][]string, 0, len(status.Providers))
 	for _, provider := range status.Providers {
-		fmt.Fprintf(output, "Provider %s：状态 %s；近期吞吐 %.2f MiB/s；首字节 %.0f ms；本进程失败 %d；最近成功 %s；最近失败 %s\n",
+		rows = append(rows, []string{
 			provider.Name,
 			formatProviderState(provider),
-			provider.ThroughputBytesPerSecond/(1<<20),
-			provider.FirstByteMillis,
-			provider.Failures,
+			fmt.Sprintf("%.2f MiB/s", provider.ThroughputBytesPerSecond/(1<<20)),
+			fmt.Sprintf("%.0f ms", provider.FirstByteMillis),
+			strconv.Itoa(provider.Failures),
 			formatHealthTime(provider.LastSuccess),
 			formatHealthTime(provider.LastFailure),
-		)
+		})
 	}
-	return 0
+	writeStatusTable(&output, headers, rows)
+	return output.String()
+}
+
+func writeStatusSummary(output *strings.Builder, entries [][2]string) {
+	for index := range entries {
+		entries[index][0] = sanitizeStatusCell(entries[index][0])
+		entries[index][1] = sanitizeStatusCell(entries[index][1])
+	}
+	keyWidth := 0
+	for _, entry := range entries {
+		keyWidth = max(keyWidth, displayWidth(entry[0]))
+	}
+	for _, entry := range entries {
+		fmt.Fprintf(output, "  %s  %s\n", padDisplay(entry[0], keyWidth), entry[1])
+	}
+}
+
+func writeStatusTable(output *strings.Builder, headers []string, rows [][]string) {
+	for rowIndex := range rows {
+		for columnIndex := range rows[rowIndex] {
+			rows[rowIndex][columnIndex] = sanitizeStatusCell(rows[rowIndex][columnIndex])
+		}
+	}
+	widths := make([]int, len(headers))
+	for index, header := range headers {
+		widths[index] = displayWidth(header)
+	}
+	for _, row := range rows {
+		for index, value := range row {
+			widths[index] = max(widths[index], displayWidth(value))
+		}
+	}
+	writeStatusTableRow(output, headers, widths)
+	for _, row := range rows {
+		writeStatusTableRow(output, row, widths)
+	}
+}
+
+func writeStatusTableRow(output *strings.Builder, values []string, widths []int) {
+	output.WriteString("  ")
+	for index, value := range values {
+		if index > 0 {
+			output.WriteString("  ")
+		}
+		output.WriteString(padDisplay(value, widths[index]))
+	}
+	output.WriteByte('\n')
+}
+
+func padDisplay(value string, width int) string {
+	return value + strings.Repeat(" ", max(0, width-displayWidth(value)))
+}
+
+func displayWidth(value string) int {
+	return runewidth.StringWidth(value)
+}
+
+func sanitizeStatusCell(value string) string {
+	var sanitized strings.Builder
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.Is(unicode.Cf, character) {
+			fmt.Fprintf(&sanitized, `\u%04X`, character)
+			continue
+		}
+		sanitized.WriteRune(character)
+	}
+	return sanitized.String()
 }
 
 func providerHealthStatuses(snapshots []router.HealthSnapshot) []control.ProviderHealth {
@@ -1273,7 +1364,7 @@ func formatHealthTime(value time.Time) string {
 	if value.IsZero() {
 		return "无"
 	}
-	return value.Local().Format(time.RFC3339)
+	return value.Local().Format("2006-01-02 15:04:05 -07:00")
 }
 
 func runStart(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
