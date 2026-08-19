@@ -3,9 +3,12 @@ package eventlog
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +20,7 @@ import (
 const (
 	defaultRetention = 7 * 24 * time.Hour
 	defaultMaxBytes  = int64(100 << 20)
+	followInterval   = 250 * time.Millisecond
 )
 
 // Event intentionally excludes headers, credentials, tokens and redirect URLs.
@@ -147,20 +151,10 @@ func (log *Log) Read(limit int) ([]Event, error) {
 	}
 	log.mu.Lock()
 	defer log.mu.Unlock()
-	entries, err := os.ReadDir(log.directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
+	paths, err := log.paths()
 	if err != nil {
 		return nil, err
 	}
-	var paths []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
-			paths = append(paths, filepath.Join(log.directory, entry.Name()))
-		}
-	}
-	sort.Strings(paths)
 	var events []Event
 	for _, path := range paths {
 		file, openErr := os.Open(path)
@@ -188,4 +182,179 @@ func (log *Log) Read(limit int) ([]Event, error) {
 		events = events[len(events)-limit:]
 	}
 	return events, nil
+}
+
+// Follow emits the newest limit events, then every event appended afterwards.
+// It follows daily rotation and returns cleanly when context is cancelled.
+func (log *Log) Follow(ctx context.Context, limit int, observe func(Event)) error {
+	if log == nil || log.directory == "" || observe == nil {
+		return nil
+	}
+	cursors, err := log.captureCursors()
+	if err != nil {
+		return err
+	}
+	initial, err := log.Read(limit)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(initial))
+	for _, event := range initial {
+		observe(event)
+		seen[eventKey(event)] = struct{}{}
+	}
+
+	ticker := time.NewTicker(followInterval)
+	defer ticker.Stop()
+	for {
+		if err := log.drain(cursors, seen, observe); err != nil {
+			return err
+		}
+		// The cursor was captured immediately before Read. Only this first drain
+		// can overlap with the initial snapshot, so retaining keys any longer
+		// would make a long-running diagnostic command grow without bound.
+		seen = nil
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+type followCursor struct {
+	offset  int64
+	pending []byte
+}
+
+func (log *Log) paths() ([]string, error) {
+	entries, err := os.ReadDir(log.directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
+			paths = append(paths, filepath.Join(log.directory, entry.Name()))
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func (log *Log) captureCursors() (map[string]*followCursor, error) {
+	paths, err := log.paths()
+	if err != nil {
+		return nil, err
+	}
+	cursors := make(map[string]*followCursor, len(paths))
+	for _, path := range paths {
+		offset, err := lastCompleteOffset(path)
+		if err != nil {
+			return nil, err
+		}
+		cursors[path] = &followCursor{offset: offset}
+	}
+	return cursors, nil
+}
+
+func (log *Log) drain(cursors map[string]*followCursor, seen map[string]struct{}, observe func(Event)) error {
+	paths, err := log.paths()
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		cursor, found := cursors[path]
+		if !found {
+			cursor = &followCursor{}
+			cursors[path] = cursor
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Size() < cursor.offset {
+			cursor.offset = 0
+			cursor.pending = nil
+		}
+		file, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := file.Seek(cursor.offset, io.SeekStart); err != nil {
+			_ = file.Close()
+			return err
+		}
+		contents, readErr := io.ReadAll(file)
+		closeErr := file.Close()
+		cursor.offset += int64(len(contents))
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		cursor.pending = append(cursor.pending, contents...)
+		for {
+			index := bytes.IndexByte(cursor.pending, '\n')
+			if index < 0 {
+				break
+			}
+			line := cursor.pending[:index]
+			cursor.pending = cursor.pending[index+1:]
+			var event Event
+			if json.Unmarshal(line, &event) != nil {
+				continue
+			}
+			key := eventKey(event)
+			if seen != nil {
+				if _, duplicate := seen[key]; duplicate {
+					continue
+				}
+				seen[key] = struct{}{}
+			}
+			observe(event)
+		}
+	}
+	return nil
+}
+
+func lastCompleteOffset(path string) (int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	const tailSize = int64(64 << 10)
+	start := max(info.Size()-tailSize, 0)
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return 0, err
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		return 0, err
+	}
+	for index := len(contents) - 1; index >= 0; index-- {
+		if contents[index] == '\n' {
+			return start + int64(index+1), nil
+		}
+	}
+	return 0, nil
+}
+
+func eventKey(event Event) string {
+	return event.Time.UTC().Format(time.RFC3339Nano) + "\x00" + event.Level + "\x00" + event.Code + "\x00" + event.Provider + "\x00" + event.Repository + "\x00" + event.Reference + "\x00" + event.Digest + "\x00" + event.Message
 }

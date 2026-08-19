@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -158,6 +159,91 @@ providers:
 			t.Errorf("events output lacks %q:\n%s", expected, output.String())
 		}
 	}
+}
+
+func TestRunEventsFollowStreamsNewRoutingEvents(t *testing.T) {
+	dataDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "drg.yaml")
+	pathForYAML := strings.ReplaceAll(filepath.ToSlash(dataDir), "'", "''")
+	contents := `
+version: 1
+data_dir: '` + pathForYAML + `'
+server:
+  listeners: [127.0.0.1:5443]
+  tls:
+    local_ca: false
+    advertise_endpoint: drg.localhost:5443
+providers:
+  - name: docker_hub
+    url: https://registry-1.docker.io
+    resolver: true
+    pull_provider: true
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write configuration: %v", err)
+	}
+	log := eventlog.New(dataDir, time.Now)
+	if err := log.Write(eventlog.Event{Level: "info", Code: "gateway_started", Message: "Gateway started"}); err != nil {
+		t.Fatalf("write initial event: %v", err)
+	}
+
+	context, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output := &synchronizedBuffer{}
+	var errors bytes.Buffer
+	exitCode := make(chan int, 1)
+	go func() {
+		exitCode <- cli.Run(context, []string{"events", "--follow", "--limit", "10", "--config", configPath}, strings.NewReader(""), output, &errors)
+	}()
+
+	waitForOutput(t, output, "gateway_started")
+	if err := log.Write(eventlog.Event{Level: "info", Code: "blob_source_selected", Provider: "mirror-a", Repository: "library/alpine", Digest: "sha256:stable", Message: "pull provider opened a blob stream"}); err != nil {
+		t.Fatalf("write streamed event: %v", err)
+	}
+	waitForOutput(t, output, "blob_source_selected")
+	cancel()
+	select {
+	case got := <-exitCode:
+		if got != 0 {
+			t.Errorf("events --follow exit code = %d, stderr = %s", got, errors.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("events --follow did not stop after context cancellation")
+	}
+	for _, expected := range []string{"Provider=mirror-a", "Repository=library/alpine", "Digest=sha256:stable"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("events --follow output lacks %q:\n%s", expected, output.String())
+		}
+	}
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (buffer *synchronizedBuffer) Write(value []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.Write(value)
+}
+
+func (buffer *synchronizedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.Buffer.String()
+}
+
+func waitForOutput(t *testing.T, output *synchronizedBuffer, expected string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(output.String(), expected) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %q in output:\n%s", expected, output.String())
 }
 
 func TestRunConfigMigrateLeavesCurrentV1ConfigurationUntouched(t *testing.T) {

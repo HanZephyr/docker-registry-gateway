@@ -55,7 +55,7 @@ func Run(ctx context.Context, arguments []string, input io.Reader, output, error
 	case "doctor":
 		return runDoctor(ctx, arguments[1:], output, errorOutput)
 	case "events":
-		return runEvents(arguments[1:], output, errorOutput)
+		return runEvents(ctx, arguments[1:], output, errorOutput)
 	case "serve":
 		return runServe(ctx, arguments[1:], output, errorOutput)
 	case "start":
@@ -1794,11 +1794,12 @@ func diagnoseTLS(loaded config.Config, output io.Writer) error {
 	return nil
 }
 
-func runEvents(arguments []string, output, errorOutput io.Writer) int {
+func runEvents(ctx context.Context, arguments []string, output, errorOutput io.Writer) int {
 	flags := flag.NewFlagSet("events", flag.ContinueOnError)
 	flags.SetOutput(errorOutput)
 	configPath := flags.String("config", "drg.yaml", "主配置文件路径")
 	limit := flags.Int("limit", 50, "最多显示的事件数量")
+	follow := flags.Bool("follow", false, "先显示最近事件，再持续跟随新事件")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || *limit < 1 {
 		if err == nil {
 			fmt.Fprintln(errorOutput, "events 不接受位置参数，且 limit 必须大于零")
@@ -1815,7 +1816,15 @@ func runEvents(arguments []string, output, errorOutput io.Writer) int {
 		fmt.Fprintf(errorOutput, "读取事件日志保留配置失败: %v\n", err)
 		return 1
 	}
-	events, err := eventlog.New(loaded.DataDir, time.Now, eventRetention).Read(*limit)
+	log := eventlog.New(loaded.DataDir, time.Now, eventRetention)
+	if *follow {
+		if err := log.Follow(ctx, *limit, func(event eventlog.Event) { printEvent(output, event) }); err != nil {
+			fmt.Fprintf(errorOutput, "跟随事件日志失败: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	events, err := log.Read(*limit)
 	if err != nil {
 		fmt.Fprintf(errorOutput, "读取事件日志失败: %v\n", err)
 		return 1
@@ -1825,26 +1834,30 @@ func runEvents(arguments []string, output, errorOutput io.Writer) int {
 		return 0
 	}
 	for _, event := range events {
-		var details []string
-		if event.Provider != "" {
-			details = append(details, "Provider="+event.Provider)
-		}
-		if event.Repository != "" {
-			details = append(details, "Repository="+event.Repository)
-		}
-		if event.Reference != "" {
-			details = append(details, "Reference="+event.Reference)
-		}
-		if event.Digest != "" {
-			details = append(details, "Digest="+event.Digest)
-		}
-		context := ""
-		if len(details) > 0 {
-			context = " " + strings.Join(details, " ")
-		}
-		fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, context, event.Message)
+		printEvent(output, event)
 	}
 	return 0
+}
+
+func printEvent(output io.Writer, event eventlog.Event) {
+	var details []string
+	if event.Provider != "" {
+		details = append(details, "Provider="+event.Provider)
+	}
+	if event.Repository != "" {
+		details = append(details, "Repository="+event.Repository)
+	}
+	if event.Reference != "" {
+		details = append(details, "Reference="+event.Reference)
+	}
+	if event.Digest != "" {
+		details = append(details, "Digest="+event.Digest)
+	}
+	context := ""
+	if len(details) > 0 {
+		context = " " + strings.Join(details, " ")
+	}
+	fmt.Fprintf(output, "%s [%s] %s%s：%s\n", event.Time.Local().Format(time.RFC3339), event.Level, event.Code, context, event.Message)
 }
 
 func printSecurityWarnings(output io.Writer, loaded config.Config) {
@@ -2102,6 +2115,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  doctor  只读诊断配置、TLS、Docker 根信任、监听和 Provider")
 	fmt.Fprintln(output, "  tls reconcile|rotate-root|clear-previous-root  对账、两阶段轮换或显式清理本地 CA")
 	fmt.Fprintln(output, "  provider list|add|remove  查看或维护上游 Provider")
+	fmt.Fprintln(output, "  events [--follow]  查看事件，或持续跟随新的诊断事件")
 	fmt.Fprintln(output, "  serve  启动前台 Gateway 服务")
 	fmt.Fprintln(output, "  start  启动后台 Gateway 服务")
 	fmt.Fprintln(output, "  status  查看本地 Gateway 运行状态")
