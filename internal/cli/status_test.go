@@ -36,11 +36,17 @@ func TestFormatStatusUsesAlignedProviderTable(t *testing.T) {
 
 	for _, expected := range []string{
 		"Gateway\n",
-		"状态      running\n",
-		"PID       296016\n",
-		"监听地址  0.0.0.0:5443, [::]:5443\n",
-		"活跃拉取  2\n",
-		"排队拉取  1\n",
+		"┌",
+		"┬",
+		"├",
+		"┼",
+		"└",
+		"┴",
+		"│ 状态",
+		"│ PID",
+		"│ 监听地址",
+		"│ 活跃拉取",
+		"│ 排队拉取",
 		"Providers\n",
 		"Provider",
 		"吞吐",
@@ -58,7 +64,7 @@ func TestFormatStatusUsesAlignedProviderTable(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
-	header := findStatusLine(t, lines, "  Provider  ")
+	header := findStatusLine(t, lines, "│ Provider")
 	firstProvider := findStatusLine(t, lines, "1pannel")
 	secondProvider := findStatusLine(t, lines, "毫秒镜像-免费版")
 	for _, column := range []string{"状态", "吞吐", "首字节", "失败", "最近成功", "最近失败"} {
@@ -77,7 +83,7 @@ func TestFormatStatusAlignsEmojiNamesAndEscapesControlCharacters(t *testing.T) {
 		{Name: "镜像😀AAAA"},
 		{Name: "abcdefghij"},
 	}})
-	if !strings.Contains(aligned, "镜像😀AAAA  可用") {
+	if !strings.Contains(aligned, "│ 镜像😀AAAA │ 可用") {
 		t.Errorf("emoji provider is not aligned to an ASCII name:\n%s", aligned)
 	}
 

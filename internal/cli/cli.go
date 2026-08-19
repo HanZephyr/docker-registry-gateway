@@ -1264,47 +1264,68 @@ func formatStatus(status control.Status) string {
 }
 
 func writeStatusSummary(output *strings.Builder, entries [][2]string) {
+	rows := make([][]string, 0, len(entries))
 	for index := range entries {
-		entries[index][0] = sanitizeStatusCell(entries[index][0])
-		entries[index][1] = sanitizeStatusCell(entries[index][1])
+		rows = append(rows, []string{entries[index][0], entries[index][1]})
 	}
-	keyWidth := 0
-	for _, entry := range entries {
-		keyWidth = max(keyWidth, displayWidth(entry[0]))
-	}
-	for _, entry := range entries {
-		fmt.Fprintf(output, "  %s  %s\n", padDisplay(entry[0], keyWidth), entry[1])
-	}
+	writeStatusBoxTable(output, nil, rows)
 }
 
 func writeStatusTable(output *strings.Builder, headers []string, rows [][]string) {
+	writeStatusBoxTable(output, headers, rows)
+}
+
+func writeStatusBoxTable(output *strings.Builder, headers []string, rows [][]string) {
+	for index := range headers {
+		headers[index] = sanitizeStatusCell(headers[index])
+	}
 	for rowIndex := range rows {
 		for columnIndex := range rows[rowIndex] {
 			rows[rowIndex][columnIndex] = sanitizeStatusCell(rows[rowIndex][columnIndex])
 		}
 	}
-	widths := make([]int, len(headers))
+	columnCount := len(headers)
+	if columnCount == 0 && len(rows) > 0 {
+		columnCount = len(rows[0])
+	}
+	widths := make([]int, columnCount)
 	for index, header := range headers {
-		widths[index] = displayWidth(header)
+		widths[index] = max(widths[index], displayWidth(header))
 	}
 	for _, row := range rows {
 		for index, value := range row {
 			widths[index] = max(widths[index], displayWidth(value))
 		}
 	}
-	writeStatusTableRow(output, headers, widths)
-	for _, row := range rows {
-		writeStatusTableRow(output, row, widths)
+	writeStatusBoxBorder(output, widths, "┌", "┬", "┐")
+	if len(headers) > 0 {
+		writeStatusBoxRow(output, headers, widths)
+		if len(rows) > 0 {
+			writeStatusBoxBorder(output, widths, "├", "┼", "┤")
+		}
 	}
+	for _, row := range rows {
+		writeStatusBoxRow(output, row, widths)
+	}
+	writeStatusBoxBorder(output, widths, "└", "┴", "┘")
 }
 
-func writeStatusTableRow(output *strings.Builder, values []string, widths []int) {
-	output.WriteString("  ")
-	for index, value := range values {
+func writeStatusBoxBorder(output *strings.Builder, widths []int, left, middle, right string) {
+	output.WriteString(left)
+	for index, width := range widths {
 		if index > 0 {
-			output.WriteString("  ")
+			output.WriteString(middle)
 		}
-		output.WriteString(padDisplay(value, widths[index]))
+		output.WriteString(strings.Repeat("─", width+2))
+	}
+	output.WriteString(right)
+	output.WriteByte('\n')
+}
+
+func writeStatusBoxRow(output *strings.Builder, values []string, widths []int) {
+	output.WriteString("│")
+	for index, value := range values {
+		fmt.Fprintf(output, " %s │", padDisplay(value, widths[index]))
 	}
 	output.WriteByte('\n')
 }
