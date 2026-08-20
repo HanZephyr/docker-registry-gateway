@@ -102,7 +102,25 @@ drg start --config ./drg.yaml
 
 Docker 部署适合已取得源码或已自行构建镜像的场景。网关容器不能替宿主机 Docker 安装证书，因此仍需在运行 Docker daemon 的主机上完成根证书信任。
 
-### 1. 生成配置
+### 1. 创建部署文件
+
+[`docker-compose.example.yml`](docker-compose.example.yml) 是随版本更新的参考模板。首次部署时先复制为本地部署文件，再按需要修改端口映射、卷挂载或重启策略；不要直接修改示例文件。
+
+Linux / macOS：
+
+```bash
+cp docker-compose.example.yml docker-compose.yml
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .\docker-compose.example.yml .\docker-compose.yml
+```
+
+保留 `drg.yaml` 和 `./.drg` 的挂载，才能在容器重建后保留配置、证书和日志。
+
+### 2. 生成配置
 
 在仓库目录执行：
 
@@ -130,7 +148,7 @@ sudo chown -R "$DRG_UID:$DRG_GID" ./.drg
 
 将生成的 `drg.yaml` 中 `data_dir: .drg` 改为 `data_dir: /var/lib/drg`，以便 Compose 持久化运行数据。
 
-### 2. 信任本地根证书
+### 3. 信任本地根证书
 
 根证书位于宿主机的 `./.drg/pki/ca.crt`。按 Docker daemon 所在平台安装：
 
@@ -142,19 +160,19 @@ sudo chown -R "$DRG_UID:$DRG_GID" ./.drg
 
 将 `<访问地址>` 替换为完整的访问地址，例如 `drg.localhost:5443` 或 `host.docker.internal:5443`。
 
-### 3. 启动与验证
+### 4. 启动与验证
 
 ```bash
-docker compose -f docker-compose.example.yml up -d --build --force-recreate
-docker compose -f docker-compose.example.yml ps
-docker compose -f docker-compose.example.yml exec drg drg logs --follow --color always --config /etc/drg/drg.yaml
+docker compose up -d --build --force-recreate
+docker compose ps
+docker compose exec drg drg logs --follow --color always --config /etc/drg/drg.yaml
 ```
 
 随后按“配置 Docker mirror”的方式修改 Docker daemon 配置并重启，再执行：
 
 ```bash
 docker pull hello-world:latest
-docker compose -f docker-compose.example.yml exec drg drg status --config /etc/drg/drg.yaml
+docker compose exec drg drg status --config /etc/drg/drg.yaml
 ```
 
 ## 日常维护
