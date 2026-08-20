@@ -250,6 +250,22 @@ go test ./...
 
 脚本会产出 Windows、Linux、macOS 的 amd64 与 arm64 原生二进制到 `dist/`。发布前还应在目标平台执行 `drg doctor`，并用真实 Docker daemon 完成 `docker pull` 验收。
 
+## 发布产物验证
+
+推送 `v` 加数字开头的标签会自动构建并创建 GitHub Release。每个 Release 包含 6 个原生二进制、`SHA256SUMS`、`BUILD-INFO.txt`、CycloneDX 格式的 `SBOM.cdx.json`，以及每个文件对应的 Cosign 无密钥签名包（`.bundle`）。
+
+下载二进制及其同名 `.bundle` 后，可用 GitHub Actions 的 OIDC 身份验证签名来源：
+
+```bash
+cosign verify-blob \
+  --bundle ./drg-linux-amd64.bundle \
+  --certificate-identity-regexp '^https://github\\.com/HanZephyr/docker-registry-gateway/\\.github/workflows/package-release\\.yml@refs/tags/v[0-9].*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ./drg-linux-amd64
+```
+
+验证成功后，再用 `SHA256SUMS` 交叉核验下载文件的散列。手动运行工作流时必须填写一个已存在的同类标签；工作流会重新打包并更新对应 Release 的资产。
+
 ## 无公网 Docker E2E fixture
 
 [`scripts/docker-e2e-fixture.ps1`](scripts/docker-e2e-fixture.ps1) 提供一个只含 OCI config 的本地镜像源，配合 [`testdata/docker-e2e-local.yaml`](testdata/docker-e2e-local.yaml) 可在无法访问 Docker Hub 的环境中验收完整成功链路：Docker Client → DRG → Provider。该 fixture 仅用于测试，默认监听 `56999`，不属于 Gateway 运行时组件。

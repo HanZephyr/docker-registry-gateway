@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   package-and-release:
@@ -73,24 +74,65 @@ jobs:
           darwin:arm64:
           TARGETS
 
-          (
-            cd dist
-            sha256sum drg-* > SHA256SUMS
-            {
-              echo "tag=${RELEASE_TAG}"
-              echo "commit=$(git rev-parse HEAD)"
-              echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            } > BUILD-INFO.txt
+      - name: Generate CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.7.0
+          "$RUNNER_TEMP/bin/cyclonedx-gomod" mod -json -output dist/SBOM.cdx.json .
+
+      - name: Generate checksums and build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "tag=${RELEASE_TAG}"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > dist/BUILD-INFO.txt
+
+          primary_assets=(
+            dist/drg-windows-*
+            dist/drg-linux-*
+            dist/drg-darwin-*
+            dist/SBOM.cdx.json
+            dist/BUILD-INFO.txt
           )
+          sha256sum "${primary_assets[@]}" > dist/SHA256SUMS
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign release assets with GitHub OIDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          primary_assets=(
+            dist/drg-windows-*
+            dist/drg-linux-*
+            dist/drg-darwin-*
+            dist/SBOM.cdx.json
+            dist/BUILD-INFO.txt
+            dist/SHA256SUMS
+          )
+          for asset in "${primary_assets[@]}"; do
+            cosign sign-blob --yes --bundle "${asset}.bundle" "$asset"
+          done
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@v6
         with:
           name: drg-${{ env.RELEASE_TAG }}
           path: |
-            dist/drg-*
+            dist/drg-windows-*
+            dist/drg-linux-*
+            dist/drg-darwin-*
             dist/SHA256SUMS
             dist/BUILD-INFO.txt
+            dist/SBOM.cdx.json
+            dist/SHA256SUMS.bundle
+            dist/BUILD-INFO.txt.bundle
+            dist/SBOM.cdx.json.bundle
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
@@ -101,7 +143,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          assets=(dist/drg-* dist/SHA256SUMS dist/BUILD-INFO.txt)
+          assets=(
+            dist/drg-windows-*
+            dist/drg-linux-*
+            dist/drg-darwin-*
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+            dist/SBOM.cdx.json
+            dist/SHA256SUMS.bundle
+            dist/BUILD-INFO.txt.bundle
+            dist/SBOM.cdx.json.bundle
+          )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
