@@ -20,10 +20,8 @@ DRG 会生成并维护本地运行数据、证书和日志；请不要将 `drg.y
 | --- | --- | --- | --- | --- |
 | Linux | 原生进程 | `127.0.0.1:5443` | `drg.localhost:5443` | `https://drg.localhost:5443` |
 | Linux | Docker 容器 | `0.0.0.0:5443` | `drg.localhost:5443` | `https://drg.localhost:5443` |
-| Windows Docker Desktop | 原生进程 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
-| Windows Docker Desktop | Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
-| macOS Docker Desktop | 原生进程 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
-| macOS Docker Desktop | Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
+| Windows Docker Desktop | 原生进程或 Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
+| macOS Docker Desktop | 原生进程或 Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
 
 容器部署中的监听地址是 **容器内** DRG 的监听地址；`docker-compose.example.yml` 会将端口发布到宿主机。Windows 和 macOS 的 Docker Desktop daemon 运行在虚拟机中，通常不能通过 `127.0.0.1` 访问宿主机上的 DRG，因此应使用 `host.docker.internal`。
 
