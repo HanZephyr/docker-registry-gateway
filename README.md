@@ -1,48 +1,66 @@
 # Docker Registry Gateway（DRG）
 
-DRG 是面向 Docker Hub 拉取的多上游代理路由器。它不实现传统 Registry 的存储、推送或删除功能；它在多个可信 Provider 间解析 manifest、按实时健康和速度选择下载源，并在可续传时进行透明切换。
+DRG 是 Docker Hub 的多上游镜像拉取网关。将它配置为 Docker mirror 后，继续使用原本的 `docker pull` 命令即可；DRG 会在已配置的上游之间选择可用下载源，并在支持 Range 的上游之间透明续传。
 
-## V1 能力边界
+> 当前版本只代理 Docker Hub 拉取，不是传统 Registry：不支持镜像推送、删除、镜像列表、`docker login` 或镜像层缓存。
 
-- 仅处理 Docker Hub 的镜像拉取；不改写 `docker` 的使用习惯。
-- Provider 可分别承担 manifest 解析和 blob 下载角色，支持上游 Bearer 登录。
-- Manifest 多源交叉校验、租约固定、健康/限流/鉴权/完整性状态、Range 续传、分片下载。
-- 默认本地 CA、`drg.localhost`、IPv4/IPv6 回环监听；也支持外部 TLS 或纯 HTTP。
-- 不支持 push、删除、catalog、tag 列表、referrers、客户端 `docker login` 或跨客户端下载合并。
-- 不缓存完整镜像层，也不依赖数据库；状态为受上限约束的本地文件。
+## 适用场景
 
-## 部署前先确定访问地址
+- Docker Hub 访问不稳定、限速或偶发中断。
+- 希望统一使用多个可信镜像上游，并保留 Docker 原有使用方式。
+- 希望在本机或内网部署一个轻量、无数据库的拉取网关。
 
-`server.tls.advertise_endpoint` 必须是 **Docker daemon 实际访问 DRG 的 `主机名:端口`**，并且该名称应与 `registry-mirrors` 中的地址一致。它不是 DRG 根据当前网络自动猜测的地址。
+DRG 会生成并维护本地运行数据、证书和日志；请不要将 `drg.yaml` 或 `.drg/` 提交到 Git。
 
-| Docker daemon 所在位置 | 推荐监听地址 | 推荐访问地址 / mirror 地址 |
+## 先确定访问地址
+
+`registry-mirrors` 中的地址必须与 DRG 引导时填写的“访问地址”一致，并且必须是 **Docker daemon 实际能访问到的地址**。
+
+| Docker daemon 所在位置 | 监听地址 | 访问地址 / mirror 地址 |
 | --- | --- | --- |
-| Linux 原生 Docker，DRG 同机原生或容器部署 | `127.0.0.1:5443`（或容器场景的 `0.0.0.0:5443`） | `drg.localhost:5443` |
-| Windows Docker Desktop，DRG 在 Windows 宿主机或容器中 | `0.0.0.0:5443` | `host.docker.internal:5443` |
-| macOS Docker Desktop，DRG 在 macOS 宿主机或容器中 | `0.0.0.0:5443` | `host.docker.internal:5443` |
-| 远程或多机 Docker daemon | 显式的内网监听地址 | 每个 daemon 都能解析到的稳定内网域名，例如 `drg.intra.example:5443` |
+| Linux 原生 Docker，DRG 同机运行 | `127.0.0.1:5443` | `drg.localhost:5443` |
+| Windows Docker Desktop，DRG 在 Windows 宿主机运行 | `0.0.0.0:5443` | `host.docker.internal:5443` |
+| macOS Docker Desktop，DRG 在 macOS 宿主机运行 | `0.0.0.0:5443` | `host.docker.internal:5443` |
+| 远程或多机部署 | 可被 Docker daemon 访问的内网地址 | 稳定内网域名，例如 `drg.intra.example:5443` |
 
-Windows/macOS 的 Docker Desktop daemon 位于虚拟机中，默认的 `127.0.0.1`/`drg.localhost` 只指向 daemon 自己，通常到不了宿主机上的 DRG。因此在 Desktop 场景应使用 `host.docker.internal`，并让 DRG 监听 `0.0.0.0:5443`。DRG 签发的本地 CA 叶证书已包含该名称。
-
-不要把 Provider 凭据、`drg.yaml` 或 `.drg/` 目录提交到 Git；其中可能包含本地控制面材料、证书和上游认证信息。
+Windows 和 macOS 的 Docker Desktop daemon 运行在虚拟机中，通常不能通过 `127.0.0.1` 访问宿主机上的 DRG，因此应使用 `host.docker.internal`。
 
 ## 原生部署
 
-原生模式是一个单文件 `drg` 进程。发布构建的文件名分别为 `drg-windows-amd64.exe`、`drg-linux-amd64`、`drg-darwin-arm64` 等；从源码构建需要 Go 1.26，仓库已包含 `vendor/`，构建不需要另行拉取 Go 依赖。
+从 [GitHub Releases](https://github.com/HanZephyr/docker-registry-gateway/releases) 下载对应平台和架构的单文件二进制：Windows 使用 `.exe`，Apple Silicon 选择 `darwin-arm64`，Intel Mac 选择 `darwin-amd64`。
 
-### Windows（Docker Desktop）
+### 1. 运行引导
 
-在 PowerShell 中构建，或将对应 Windows 二进制放入工作目录：
+Windows PowerShell：
 
 ```powershell
-./scripts/build-release.ps1
-$drg = .\dist\drg-windows-amd64.exe
+$drg = .\drg-windows-amd64.exe
 & $drg onboard --config .\drg.yaml
 ```
 
-引导时输入 `0.0.0.0:5443` 作为监听地址、`host.docker.internal:5443` 作为访问地址，并选择默认的 `local_ca`。DRG 会生成 `drg.yaml`、`.drg\` 和证书，尝试安装当前用户的根证书；随后重启 Docker Desktop，使其同步新根证书。
+Linux：
 
-在 Docker Desktop 的 **Settings → Docker Engine** 中，将下面字段与现有 JSON 合并后点击 **Apply & restart**，不要覆盖其他已有配置：
+```bash
+mv ./drg-linux-amd64 ./drg
+chmod +x ./drg
+./drg onboard --config ./drg.yaml
+```
+
+macOS：将 `darwin-arm64` 或 `darwin-amd64` 二进制改名为 `drg` 后执行同一命令：
+
+```bash
+mv ./drg-darwin-arm64 ./drg # Intel Mac 请使用 drg-darwin-amd64
+chmod +x ./drg
+./drg onboard --config ./drg.yaml
+```
+
+引导时按上表填写监听地址和访问地址；首次使用建议选择默认的 `local_ca`。至少配置一个既可解析又可下载的上游 Provider。引导默认会启动 DRG；只想先生成配置时加 `--no-start`。下文的 `drg` 表示已加入 `PATH` 的二进制；未加入时，请使用 Windows 的 `& $drg` 或 Linux/macOS 的 `./drg`。
+
+DRG 会尝试自动安装本地根证书。若权限不足，它会输出对应平台的操作提示；完成后执行 `drg tls reconcile --config <配置文件>`，然后重启 Docker daemon 或 Docker Desktop。
+
+### 2. 配置 Docker mirror
+
+Windows / macOS：在 Docker Desktop 的 **Settings → Docker Engine** 中，将下面字段与现有 JSON 合并后点击 **Apply & restart**：
 
 ```json
 {
@@ -50,61 +68,7 @@ $drg = .\dist\drg-windows-amd64.exe
 }
 ```
 
-验证与日常维护：
-
-```powershell
-docker pull hello-world:latest
-& $drg status --config .\drg.yaml
-& $drg logs --follow --color always --config .\drg.yaml
-```
-
-### macOS（Docker Desktop）
-
-在 Terminal 中构建目标二进制，Apple Silicon 使用 `arm64`，Intel 使用 `amd64`：
-
-```bash
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=vendor -trimpath -ldflags='-s -w' -o ./drg ./cmd/drg
-chmod +x ./drg
-./drg onboard --config ./drg.yaml
-```
-
-引导时同样选择 `0.0.0.0:5443` 与 `host.docker.internal:5443`。若自动写入系统钥匙串因权限不足而失败，按 `drg tls reconcile` 输出的命令执行；通常形式如下：
-
-```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./.drg/pki/ca.crt
-```
-
-重启 Docker Desktop 后，在 **Settings → Docker Engine** 合并以下镜像源配置并应用：
-
-```json
-{
-  "registry-mirrors": ["https://host.docker.internal:5443"]
-}
-```
-
-```bash
-docker pull hello-world:latest
-./drg status --config ./drg.yaml
-./drg logs --follow --color always --config ./drg.yaml
-```
-
-### Linux（原生 Docker Engine）
-
-构建并执行引导：
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -ldflags='-s -w' -o ./drg ./cmd/drg
-chmod +x ./drg
-./drg onboard --config ./drg.yaml
-```
-
-同机部署可接受默认的 `127.0.0.1:5443` 与 `drg.localhost:5443`。若本地 CA 自动安装因权限不足失败，使用生成的根证书为 Docker 配置信任目录：
-
-```bash
-sudo install -D -m 0644 ./.drg/pki/ca.crt /etc/docker/certs.d/drg.localhost:5443/drg-ca.crt
-```
-
-将镜像源字段与 `/etc/docker/daemon.json` 中现有 JSON 合并，然后重启 Docker：
+Linux：将以下字段与 `/etc/docker/daemon.json` 的现有 JSON 合并，然后重启 Docker：
 
 ```json
 {
@@ -112,160 +76,125 @@ sudo install -D -m 0644 ./.drg/pki/ca.crt /etc/docker/certs.d/drg.localhost:5443
 }
 ```
 
+访问地址不是这两个示例时，请替换为引导时填写的完整地址。
+
+### 3. 验证
+
 ```bash
-sudo systemctl restart docker
 docker pull hello-world:latest
-./drg status --config ./drg.yaml
-./drg logs --follow --color always --config ./drg.yaml
+drg status --config ./drg.yaml
+drg logs --follow --color always --config ./drg.yaml
 ```
 
-`drg start --config ./drg.yaml` 是跨平台的本地后台运行方式；Linux 的长期服务部署可由 systemd 托管 `drg serve --config /etc/drg/drg.yaml`。Windows/macOS 的长期运行同样应交给各自的服务管理器或登录项管理，而不是依赖打开的终端。
+`logs --follow` 会持续显示路由、上游选择和切换信息；按回车可插入空行分隔，按 `Ctrl+C` 退出。
+
+### 长期运行
+
+`drg serve --config ./drg.yaml` 以前台方式运行，适合交由 systemd、Windows 服务或 macOS 登录项托管。仅在本机临时后台运行时使用：
+
+```bash
+drg start --config ./drg.yaml
+```
 
 ## Docker 部署
 
-Docker 部署通过 [docker-compose.example.yml](docker-compose.example.yml) 运行 Linux 容器。它挂载 `drg.yaml` 和 `.drg/`，因此容器重建不会丢失本地 CA、证书、控制面信息或统一日志。
+Docker 部署适合已取得源码或已自行构建镜像的场景。网关容器不能替宿主机 Docker 安装证书，因此仍需在运行 Docker daemon 的主机上完成根证书信任。
 
-### 1. 生成容器配置
+### 1. 生成配置
 
-先构建镜像，再通过一次性容器运行交互引导。Windows PowerShell：
+在仓库目录执行：
+
+```bash
+docker build -t docker-registry-gateway:local .
+docker run --rm -it -v "$PWD:/workspace" docker-registry-gateway:local \
+  onboard --config /workspace/drg.yaml --no-start --skip-trust-install
+```
+
+Windows PowerShell 将挂载参数改为：
 
 ```powershell
-docker build -t docker-registry-gateway:local .
 docker run --rm -it -v "${PWD}:/workspace" docker-registry-gateway:local onboard --config /workspace/drg.yaml --no-start --skip-trust-install
 ```
 
-Linux/macOS Shell：
+Linux 宿主机需要让引导容器以当前用户写入工作目录；配置生成后，再将数据目录交给运行网关的容器用户：
 
 ```bash
-docker build -t docker-registry-gateway:local .
-docker run --rm -it -v "$PWD:/workspace" docker-registry-gateway:local onboard --config /workspace/drg.yaml --no-start --skip-trust-install
-```
-
-Linux 的 bind mount 还需处理容器内非 root 用户的文件权限：在上述 Linux 命令中加上 `--user "$(id -u):$(id -g)"`，让引导先以当前宿主机用户生成 `drg.yaml` 与 `.drg/`；在启动 Compose 前，再将数据目录交给镜像内 `drg` 用户：
-
-```bash
+docker run --rm -it --user "$(id -u):$(id -g)" -v "$PWD:/workspace" docker-registry-gateway:local \
+  onboard --config /workspace/drg.yaml --no-start --skip-trust-install
 DRG_UID=$(docker run --rm --entrypoint sh docker-registry-gateway:local -c 'id -u drg')
 DRG_GID=$(docker run --rm --entrypoint sh docker-registry-gateway:local -c 'id -g drg')
 sudo chown -R "$DRG_UID:$DRG_GID" ./.drg
 ```
 
-只调整 `.drg/`，不要把整个源码目录改为容器用户所有。
+将生成的 `drg.yaml` 中 `data_dir: .drg` 改为 `data_dir: /var/lib/drg`，以便 Compose 持久化运行数据。
 
-选择地址时遵循上表：Linux 同机 Docker 用 `0.0.0.0:5443` / `drg.localhost:5443`，Windows/macOS Docker Desktop 用 `0.0.0.0:5443` / `host.docker.internal:5443`。引导完成后，将生成的 `drg.yaml` 中：
+### 2. 信任本地根证书
 
-```yaml
-data_dir: .drg
-```
+根证书位于宿主机的 `./.drg/pki/ca.crt`。按 Docker daemon 所在平台安装：
 
-改为：
+| 平台 | 操作 |
+| --- | --- |
+| Linux | `sudo install -D -m 0644 ./.drg/pki/ca.crt /etc/docker/certs.d/<访问地址>/drg-ca.crt`，然后重启 Docker |
+| Windows Docker Desktop | `certutil -user -addstore Root .\.drg\pki\ca.crt`，然后重启 Docker Desktop |
+| macOS Docker Desktop | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./.drg/pki/ca.crt`，然后重启 Docker Desktop |
 
-```yaml
-data_dir: /var/lib/drg
-```
+将 `<访问地址>` 替换为完整的访问地址，例如 `drg.localhost:5443` 或 `host.docker.internal:5443`。
 
-这是必需步骤：Compose 将宿主机的 `./.drg` 挂载到容器内 `/var/lib/drg`。不要删除宿主机已经生成的 `./.drg` 目录。
-
-### 2. 安装 Docker daemon 对本地 CA 的信任
-
-容器不能安全修改 Docker 宿主机的证书库。根证书始终在宿主机工作目录的 `./.drg/pki/ca.crt`；按 **运行 Docker daemon 的平台** 安装，而不是按容器内 Linux 安装：
-
-| Docker daemon 平台 | 安装根证书 | 后续动作 |
-| --- | --- | --- |
-| Linux | `sudo install -D -m 0644 ./.drg/pki/ca.crt /etc/docker/certs.d/<访问地址>/drg-ca.crt` | 重启 Docker |
-| Windows Docker Desktop | `certutil -user -addstore Root .\.drg\pki\ca.crt` | 重启 Docker Desktop |
-| macOS Docker Desktop | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./.drg/pki/ca.crt` | 重启 Docker Desktop |
-
-将 Linux 示例中的 `<访问地址>` 替换为配置的完整 `advertise_endpoint`，例如 `drg.localhost:5443`。如果地址或端口变更，执行 `drg tls reconcile`（容器内通过下文的 `docker compose exec`）以重新签发相应 SAN 的叶证书，并为新访问地址安装根证书。
-
-### 3. 启动、配置 mirror 与验收
+### 3. 启动与验证
 
 ```bash
 docker compose -f docker-compose.example.yml up -d --build --force-recreate
 docker compose -f docker-compose.example.yml ps
-docker compose -f docker-compose.example.yml exec drg drg doctor --config /etc/drg/drg.yaml
 docker compose -f docker-compose.example.yml exec drg drg logs --follow --color always --config /etc/drg/drg.yaml
 ```
 
-Docker daemon 的镜像源配置仍由部署者维护：Linux 合并到 `/etc/docker/daemon.json`，Windows/macOS 合并到 Docker Desktop 的 Docker Engine JSON。镜像源 URL 必须等于本机配置的 `advertise_endpoint`，例如：
-
-```json
-{
-  "registry-mirrors": ["https://drg.localhost:5443"]
-}
-```
-
-或 Docker Desktop 场景：
-
-```json
-{
-  "registry-mirrors": ["https://host.docker.internal:5443"]
-}
-```
-
-应用 Docker 配置并重启 daemon 后，拉取一个未存在的镜像验证完整路径：
+随后按“配置 Docker mirror”的方式修改 Docker daemon 配置并重启，再执行：
 
 ```bash
 docker pull hello-world:latest
 docker compose -f docker-compose.example.yml exec drg drg status --config /etc/drg/drg.yaml
 ```
 
-`docker compose logs -f drg` 适合查看容器生命周期输出；DRG 的路由、切换、分片与 Provider 诊断应统一通过 `drg logs` 查看。容器停止或升级前可执行 `docker compose -f docker-compose.example.yml exec drg drg stop --config /etc/drg/drg.yaml`；紧急情况下才使用 `--force`。
-
-## 常用维护命令
-
-```powershell
-drg doctor --skip-providers       # 只读诊断配置、TLS、Docker 根信任、监听和 Docker daemon
-drg config migrate                # 检查是否需要迁移配置格式
-drg provider list
-drg provider add --name mirror-a --url https://example.invalid --pull-provider
-drg reload                        # 校验后热加载；仅影响新请求
-drg status
-drg logs --limit 50
-drg logs --follow --limit 50      # 先显示最近日志，再持续跟随；回车分隔，Ctrl+C 退出
-drg logs --follow --color always  # 强制彩色输出；默认 auto 仅在终端启用
-drg stop                          # 显示排空进度，最长等待 30 秒
-drg stop --force                  # 立即中断活跃拉取
-drg tls reconcile
-drg tls rotate-root               # 先准备新根并安装为额外 Docker 信任根，再安全激活
-drg tls rotate-root --activate    # 容器部署时，在宿主机完成手动信任安装后的显式确认
-drg tls clear-previous-root       # 完成旧根 Docker 信任清理后，显式解除下一次轮换锁定
-```
-
-大 blob 启动分片下载时，`drg logs --follow` 会输出 `segmented_download_started`，其中包含逻辑分片数量及各上游实际 Range；这可作为分片是否启用的直接诊断证据。`drg events` 暂时保留为兼容别名。
-
-### 本地 CA 根轮换
-
-`drg tls rotate-root` 绝不会先切换服务端证书再尝试安装 Docker 信任。它先将 `ca.next.crt` 作为额外信任根安装；成功后才激活新根和新叶证书，并保留旧根为 `ca.previous.crt`。容器内运行时，DRG 不会猜测宿主机路径：它会停在“待激活”状态、输出宿主机操作说明，用户完成信任安装后执行带 `--activate` 的同一命令。
-
-旧根的本地标记会一直保留，避免下一次轮换误删迁移材料。仅当你已从 Docker 信任库显式移除旧根后，才执行 `drg tls clear-previous-root`。根轮换完成后重启 Gateway，使新连接使用新叶证书。
-
-## 构建与验证
-
-Windows PowerShell：
-
-```powershell
-./scripts/build-release.ps1
-go test ./...
-```
-
-脚本会产出 Windows、Linux、macOS 的 amd64 与 arm64 原生二进制到 `dist/`。发布前还应在目标平台执行 `drg doctor`，并用真实 Docker daemon 完成 `docker pull` 验收。
-
-## 发布产物验证
-
-推送 `v` 加数字开头的标签会自动构建并创建 GitHub Release。每个 Release 包含 6 个原生二进制、`SHA256SUMS`、`BUILD-INFO.txt`、CycloneDX 格式的 `SBOM.cdx.json`，以及每个文件对应的 Cosign 无密钥签名包（`.bundle`）。
-
-下载二进制及其同名 `.bundle` 后，可用 GitHub Actions 的 OIDC 身份验证签名来源：
+## 日常维护
 
 ```bash
-cosign verify-blob \
-  --bundle ./drg-linux-amd64.bundle \
-  --certificate-identity-regexp '^https://github\\.com/HanZephyr/docker-registry-gateway/\\.github/workflows/package-release\\.yml@refs/tags/v[0-9].*$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ./drg-linux-amd64
+drg doctor --config ./drg.yaml          # 只读检查配置、证书、Docker 信任与 Provider
+drg provider list --config ./drg.yaml   # 查看上游
+drg provider add --name mirror-a --url https://example.invalid --resolver --pull-provider --config ./drg.yaml
+drg reload --config ./drg.yaml          # 校验后热加载配置，仅影响新请求
+drg status --config ./drg.yaml
+drg logs --limit 50 --config ./drg.yaml
+drg logs --follow --color always --config ./drg.yaml
+drg stop --config ./drg.yaml             # 等待当前拉取排空后停止
+drg stop --force --config ./drg.yaml     # 立即中断活跃拉取
+drg tls reconcile --config ./drg.yaml    # 对账、补齐或续签本地证书
 ```
 
-验证成功后，再用 `SHA256SUMS` 交叉核验下载文件的散列。手动运行工作流时必须填写一个已存在的同类标签；工作流会重新打包并更新对应 Release 的资产。
+上游需要认证时，优先将密码或 PAT 放入权限受限的文件，再通过 `--secret-file` 添加 Provider；`--password` 支持明文配置，但不建议使用。
 
-## 无公网 Docker E2E fixture
+## 常见问题
 
-[`scripts/docker-e2e-fixture.ps1`](scripts/docker-e2e-fixture.ps1) 提供一个只含 OCI config 的本地镜像源，配合 [`testdata/docker-e2e-local.yaml`](testdata/docker-e2e-local.yaml) 可在无法访问 Docker Hub 的环境中验收完整成功链路：Docker Client → DRG → Provider。该 fixture 仅用于测试，默认监听 `56999`，不属于 Gateway 运行时组件。
+**配置 mirror 后日志没有新请求**
+
+确认 Docker daemon 已重启，`registry-mirrors` 使用的是 DRG 的访问地址，并拉取一个本机尚不存在的镜像。Windows/macOS Docker Desktop 场景通常应使用 `host.docker.internal:5443`，而不是 `drg.localhost:5443`。
+
+**Docker 报证书不受信任**
+
+执行 `drg tls reconcile --config ./drg.yaml`，按输出提示安装根证书，并重启 Docker daemon 或 Docker Desktop。
+
+**如何确认拉取经过 DRG**
+
+在另一终端运行 `drg logs --follow --color always --config ./drg.yaml`，再执行 `docker pull`。出现 `resolution_selected`、`manifest_source_selected` 或 `blob_source_selected` 即表示请求已进入 DRG。
+
+**如何查看全部命令和参数**
+
+```bash
+drg --help
+drg <命令> --help
+```
+
+## 安全说明
+
+Provider 的账号、密码、PAT、证书和运行状态都可能保存在 `drg.yaml`、密码文件或 `.drg/` 中。请限制这些文件的访问权限，不要提交到版本库，也不要将其上传到公开位置。
+
+安全问题请参阅 [SECURITY.md](SECURITY.md)。
