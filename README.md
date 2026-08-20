@@ -14,16 +14,20 @@ DRG 会生成并维护本地运行数据、证书和日志；请不要将 `drg.y
 
 ## 先确定访问地址
 
-`registry-mirrors` 中的地址必须与 DRG 引导时填写的“访问地址”一致，并且必须是 **Docker daemon 实际能访问到的地址**。
+`registry-mirrors` 中的 URL 必须与 DRG 引导时填写的“访问地址”一致，并且必须是 **Docker daemon 实际能访问到的地址**。以下六种本机部署组合可直接使用：
 
-| Docker daemon 所在位置 | 监听地址 | 访问地址 / mirror 地址 |
-| --- | --- | --- |
-| Linux 原生 Docker，DRG 同机运行 | `127.0.0.1:5443` | `drg.localhost:5443` |
-| Windows Docker Desktop，DRG 在 Windows 宿主机运行 | `0.0.0.0:5443` | `host.docker.internal:5443` |
-| macOS Docker Desktop，DRG 在 macOS 宿主机运行 | `0.0.0.0:5443` | `host.docker.internal:5443` |
-| 远程或多机部署 | 可被 Docker daemon 访问的内网地址 | 稳定内网域名，例如 `drg.intra.example:5443` |
+| Docker daemon 平台 | DRG 部署方式 | 引导时填写的监听地址 | 引导时填写的访问地址 | `registry-mirrors` 值 |
+| --- | --- | --- | --- | --- |
+| Linux | 原生进程 | `127.0.0.1:5443` | `drg.localhost:5443` | `https://drg.localhost:5443` |
+| Linux | Docker 容器 | `0.0.0.0:5443` | `drg.localhost:5443` | `https://drg.localhost:5443` |
+| Windows Docker Desktop | 原生进程 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
+| Windows Docker Desktop | Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
+| macOS Docker Desktop | 原生进程 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
+| macOS Docker Desktop | Docker 容器 | `0.0.0.0:5443` | `host.docker.internal:5443` | `https://host.docker.internal:5443` |
 
-Windows 和 macOS 的 Docker Desktop daemon 运行在虚拟机中，通常不能通过 `127.0.0.1` 访问宿主机上的 DRG，因此应使用 `host.docker.internal`。
+容器部署中的监听地址是 **容器内** DRG 的监听地址；`docker-compose.example.yml` 会将端口发布到宿主机。Windows 和 macOS 的 Docker Desktop daemon 运行在虚拟机中，通常不能通过 `127.0.0.1` 访问宿主机上的 DRG，因此应使用 `host.docker.internal`。
+
+如果 Docker daemon 与 DRG 不在同一台机器，请使用双方都能解析和访问的稳定内网域名（例如 `drg.intra.example:5443`），并将该名称作为访问地址和 mirror 地址。
 
 ## 原生部署
 
